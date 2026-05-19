@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.env
+.envrc
+*.log
+node_modules/
