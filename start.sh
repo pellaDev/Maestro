@@ -15,4 +15,4 @@ BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$BIN_DIR"
 
 echo "[maestro] Starting tray daemon from $BIN_DIR"
-exec python3 tray.py --bin-dir "$BIN_DIR"
+exec /usr/bin/python3 tray.py --bin-dir "$BIN_DIR"

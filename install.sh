@@ -87,10 +87,10 @@ hdr "Checking requirements…"
 
 # Python 3.11+
 PY_OK=false
-if command -v python3 &>/dev/null; then
-  PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-  PY_MAJOR=$(python3 -c "import sys; print(sys.version_info.major)")
-  PY_MINOR=$(python3 -c "import sys; print(sys.version_info.minor)")
+if /usr/bin/python3 --version &>/dev/null; then
+  PY_VER=$(/usr/bin/python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+  PY_MAJOR=$(/usr/bin/python3 -c "import sys; print(sys.version_info.major)")
+  PY_MINOR=$(/usr/bin/python3 -c "import sys; print(sys.version_info.minor)")
   if [[ "$PY_MAJOR" -ge 3 && "$PY_MINOR" -ge 11 ]]; then
     ok "Python ${PY_VER}"
     PY_OK=true
@@ -105,7 +105,7 @@ fi
 
 # python3-gobject (gi.repository.Gtk)
 GTK_OK=false
-if $PY_OK && python3 -c "import gi; gi.require_version('Gtk','3.0'); from gi.repository import Gtk" &>/dev/null; then
+if $PY_OK && /usr/bin/python3 -c "import gi; gi.require_version('Gtk','3.0'); from gi.repository import Gtk" &>/dev/null; then
   ok "python3-gobject (GTK)"
   GTK_OK=true
 else
@@ -243,7 +243,7 @@ Hidden=false
 X-GNOME-Autostart-enabled=true
 EOF
     # Update settings.json to reflect autostart=true
-    python3 -c "
+    /usr/bin/python3 -c "
 import json, pathlib
 p = pathlib.Path('${SETTINGS_FILE}')
 s = json.loads(p.read_text())
