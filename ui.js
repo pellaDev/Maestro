@@ -911,9 +911,11 @@ function openSettings(){
 
     // ── Links section ──────────────────────────────────────────────────────────
     const secLinks=_smSection('Links');
+    const linksRow=el('div','sm-links-row');
     const gh=el('a','sm-link');gh.href='https://github.com/AIdevelopmentPit/Maestro';gh.target='_blank';gh.textContent='⭐ Open on GitHub';
-    const coffee=el('a','sm-link');coffee.href='#';coffee.textContent='☕ Buy me a coffee';
-    secLinks.append(gh,coffee);
+    const coffee=el('a','sm-btn');coffee.href='#';coffee.textContent='☕ Buy me a coffee';
+    linksRow.append(gh,coffee);
+    secLinks.appendChild(linksRow);
     body.appendChild(secLinks);
 
     // ── Footer ────────────────────────────────────────────────────────────────
