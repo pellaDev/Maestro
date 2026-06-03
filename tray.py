@@ -288,12 +288,12 @@ class MaestroTray:
         self._restart_pending   = False    # menu hint for host/port changes
         self._settings          = _load_settings()
 
-        # Build tray icon
+        # Build tray icon — defer first render to after Gtk.main() starts
         self._icon = Gtk.StatusIcon()
-        self._icon.set_tooltip_text("Maestro")
         self._icon.connect("popup-menu", self._on_popup)
         self._icon.connect("activate",   self._on_activate)
-        self._update_icon(self.STATE_DOWN)
+        # Schedule initial icon render after GTK display is ready
+        GLib.idle_add(self._update_icon, self.STATE_DOWN)
 
     # ── Icon ───────────────────────────────────────────────────────────────────
     def _update_icon(self, state: str):
@@ -303,14 +303,24 @@ class MaestroTray:
             self.STATE_DOWN: _DOT_RED,
             self.STATE_OFF:  _DOT_GREY,
         }[state]
-        pixbuf = _make_icon_pixbuf(color)
-        GLib.idle_add(self._icon.set_from_pixbuf, pixbuf)
         tip = {
             self.STATE_UP:   "Maestro — running",
             self.STATE_DOWN: "Maestro — stopped / crashed",
             self.STATE_OFF:  "Maestro — shut down",
         }[state]
-        GLib.idle_add(self._icon.set_tooltip_text, tip)
+
+        def _apply():
+            try:
+                pixbuf = _make_icon_pixbuf(color)
+                self._icon.set_from_pixbuf(pixbuf)
+            except Exception:
+                pass   # GTK not ready yet — will be called again by health loop
+            try:
+                self._icon.set_tooltip_text(tip)
+            except Exception:
+                pass
+
+        GLib.idle_add(_apply)
 
     # ── Activation (left click / double click) ─────────────────────────────────
     def _on_activate(self, icon):
