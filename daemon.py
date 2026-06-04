@@ -741,6 +741,14 @@ def kill_entry(idx: int):
         e.manually_killed = True
         _kill_proc(e)
         _kill_ext(e)
+        # For open_outside scripts, also kill by PID directly —
+        # the terminal emulator may not propagate SIGTERM to the child script.
+        if e.open_outside and e.pid is not None:
+            try:
+                os.killpg(os.getpgid(e.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:    os.kill(e.pid, signal.SIGTERM)
+                except: pass
         e.pid   = None
         e.crash = False
         save_config()

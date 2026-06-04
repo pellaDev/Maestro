@@ -58,6 +58,8 @@ let _loadN=0;
 const _loadFill=document.getElementById('loadfill');
 function showLoad(){ _loadN++;_loadFill.classList.add('act'); }
 function hideLoad(){ if(--_loadN<=0){_loadN=0;_loadFill.classList.remove('act');} }
+// Safety: if loadbar gets stuck, reset after 8s
+setInterval(()=>{ if(_loadN>0){_loadN=0;_loadFill.classList.remove('act');} },8000);
 
 // ── API ───────────────────────────────────────────────────────────────────────
 async function api(method,path,body){
@@ -711,7 +713,13 @@ function attachDrag(panel,hdr,uid){
 function connectSSE(uid){
   if(sseConns[uid]) sseConns[uid].close();
   const es=new EventSource(`/api/logs/${uid}`);sseConns[uid]=es;
-  let replay=true;setTimeout(()=>replay=false,3000);
+  let replay=true;
+  setTimeout(()=>{
+    replay=false;
+    // After replay window closes, scroll panel to bottom
+    const body=document.querySelector(`.tp[data-uid="${CSS.escape(uid)}"] .tp-body`);
+    if(body) body.scrollTop=body.scrollHeight;
+  },3000);
   es.addEventListener('log',  ev=>appendLog(uid,ev.data,'',replay));
   es.addEventListener('clear',()=>document.querySelector(`[data-ppre="${uid}"]`)?.replaceChildren());
   es.addEventListener('crash',ev=>{
@@ -812,7 +820,7 @@ async function doLaunchAllFav(){
     await api('POST','/api/launch',{uid:e.uid});
     if(!e.launchHidden&&!panels.includes(e.uid)) openPanel(e.uid);
     else if(!panels.includes(e.uid)){panels.push(e.uid);connectSSE(e.uid);}
-    await new Promise(r=>setTimeout(r,500));
+    await new Promise(r=>setTimeout(r,800));
   }
   hideLoad();_pollSoon();
 }
