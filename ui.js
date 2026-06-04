@@ -820,17 +820,21 @@ async function doLaunchAllFav(){
   showLoad();
   for(const e of entries.filter(e=>e.status==='ON'&&!e.unreachable)){
     await api('POST','/api/launch',{uid:e.uid});
-    if(!panels.includes(e.uid)){
-      panels.push(e.uid);
-      if(!e.launchHidden){
-        renderGrid();_savePanels();
+    // For open_outside scripts: skip opening the internal panel during batch launch.
+    // The external terminal handles I/O; sidebar state will update via the next poll.
+    if(!e.openOutside){
+      if(!panels.includes(e.uid)){
+        panels.push(e.uid);
+        if(!e.launchHidden){
+          renderGrid();_savePanels();
+        }
+        connectSSE(e.uid);
       }
-      connectSSE(e.uid);
     }
     await new Promise(r=>setTimeout(r,800));
   }
   hideLoad();
-  // Full poll after all launches to ensure sidebar reflects final state
+  // Single full poll at the end to sync all sidebar states
   await poll();
 }
 
