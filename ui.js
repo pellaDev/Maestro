@@ -169,6 +169,29 @@ function _pollSoon(){
   setTimeout(poll,3000);
 }
 
+// Like poll() but always forces a full sidebar re-render regardless of hash.
+// Use after batch operations where daemon state may lag behind.
+async function forcePoll(){
+  const d=await api('GET','/api/state');
+  if(!d||!d.entries) return;
+  entries=d.entries;
+  if(d.loggingEnabled!==undefined) _loggingEnabled=d.loggingEnabled;
+  if(d.gpu)             _gpu=d.gpu;
+  if(d.sysCpu!==undefined)     _sysCpu=d.sysCpu;
+  if(d.sysRam!==undefined)     _sysRam=d.sysRam;
+  if(d.sysRamTotal!==undefined) _sysRamTotal=d.sysRamTotal;
+  // Force full re-render ignoring hash
+  _prevHash='';
+  renderSidebar();
+  renderPills();
+  updatePanelMeta();
+  patchPanelTitles();
+  _patchPanelColors();
+  if(_pageVisible) updateMaestroBar();
+  updateFooterForActiveTab();
+  _updateMaestroEye();
+}
+
 setInterval(()=>{ if(_pageVisible)poll(); },2000);
 poll();
 
@@ -818,24 +841,24 @@ async function doClearLog(uid){
 
 async function doLaunchAllFav(){
   showLoad();
-  for(const e of entries.filter(e=>e.status==='ON'&&!e.unreachable)){
+  const favs=entries.filter(e=>e.status==='ON'&&!e.unreachable);
+  for(const e of favs){
     await api('POST','/api/launch',{uid:e.uid});
-    // For open_outside scripts: skip opening the internal panel during batch launch.
-    // The external terminal handles I/O; sidebar state will update via the next poll.
-    if(!e.openOutside){
-      if(!panels.includes(e.uid)){
-        panels.push(e.uid);
-        if(!e.launchHidden){
-          renderGrid();_savePanels();
-        }
-        connectSSE(e.uid);
-      }
+    // For internal scripts: open panel and connect SSE now
+    if(!e.openOutside&&!panels.includes(e.uid)){
+      panels.push(e.uid);
+      if(!e.launchHidden){ renderGrid();_savePanels(); }
+      connectSSE(e.uid);
     }
     await new Promise(r=>setTimeout(r,800));
   }
   hideLoad();
-  // Single full poll at the end to sync all sidebar states
-  await poll();
+  // Give daemon time to assign PIDs, then force full sidebar re-render
+  await new Promise(r=>setTimeout(r,600));
+  await forcePoll();
+  // Second pass after another short wait to catch any lagging PIDs
+  await new Promise(r=>setTimeout(r,1500));
+  await forcePoll();
 }
 
 async function doKillAll(){
