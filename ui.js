@@ -716,10 +716,12 @@ function connectSSE(uid){
   let replay=true;
   setTimeout(()=>{
     replay=false;
-    // After replay window closes, scroll panel to bottom
-    const body=document.querySelector(`.tp[data-uid="${CSS.escape(uid)}"] .tp-body`);
-    if(body) body.scrollTop=body.scrollHeight;
-  },3000);
+    // After replay window closes, scroll panel to bottom via rAF to ensure DOM is painted
+    requestAnimationFrame(()=>{
+      const body=document.querySelector(`.tp[data-uid="${CSS.escape(uid)}"] .tp-body`);
+      if(body) body.scrollTop=body.scrollHeight;
+    });
+  },1500);
   es.addEventListener('log',  ev=>appendLog(uid,ev.data,'',replay));
   es.addEventListener('clear',()=>document.querySelector(`[data-ppre="${uid}"]`)?.replaceChildren());
   es.addEventListener('crash',ev=>{
@@ -895,6 +897,10 @@ function openSettings(){
     }));
     secGen.appendChild(_smToggle('Tray persistent','trayPersistent',s.trayPersistent!==false,async v=>{
       await api('POST','/api/settings',{trayPersistent:v});
+      await _fetchSettings();
+    }));
+    secGen.appendChild(_smToggle('OS Notifications','systemNotifications',s.systemNotifications!==false,async v=>{
+      await api('POST','/api/settings',{systemNotifications:v});
       await _fetchSettings();
     }));
     body.appendChild(secGen);

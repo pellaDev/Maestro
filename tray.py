@@ -73,6 +73,7 @@ _DEFAULT_SETTINGS = {
     "openBrowserAtLaunch": False,
     "autostart":           False,
     "trayPersistent":      True,
+    "systemNotifications": True,
     "host":                "127.0.0.1",
     "port":                8865,
     "dataDir":             "",
@@ -105,6 +106,9 @@ def _get_url() -> str:
 
 # ── Desktop notifications ──────────────────────────────────────────────────────
 def _notify(title: str, body: str):
+    """Best-effort notify-send. Non-blocking. Silent if systemNotifications is off."""
+    if not _load_settings().get("systemNotifications", True):
+        return
     cmd = ["notify-send", title, body, "--expire-time", "4000"]
     if ICON_PNG.exists():
         cmd += ["--icon", str(ICON_PNG)]

@@ -701,24 +701,33 @@ def _monitor(e, gen: int):
 def _monitor_external(e, proc, gen: int):
     """
     Wait for the external terminal process to exit.
-    Does NOT fire close_panel — external terminal close is considered voluntary.
+    Updates e.pid and fires close_panel / crash events so the UI stays in sync.
     Bails out silently if a newer launch has superseded this one.
     """
     try:    proc.wait()
     except Exception: pass
     if e.generation != gen:
         return
-    # _kill_ext already cleared ext_proc — this was an intentional kill
-    if e.ext_proc is not proc and e.ext_proc is not None:
-        return
+    # _kill_ext already cleared ext_proc — this was an intentional kill from Maestro
+    intentional = e.ext_proc is not proc and e.ext_proc is not None
     with _lock:
         e.pid = None
+        e.crash = False
         if e.ext_proc is proc:
             e.ext_proc = None
         save_config()
     rc = proc.returncode if proc.returncode is not None else "?"
     _append_log(e, f"[MAESTRO] ■ External terminal closed (exit {rc})")
-    _mlog(f"[{e.display_name()}] ■ External closed")
+    _mlog(f"[{e.display_name()}] ■ External closed (exit {rc})")
+    if not intentional and not e.manually_killed:
+        # Terminal was closed by the user — treat as stopped, not crashed
+        _pub(e, "crash", str(rc))   # reuse crash event to trigger UI panel update
+        if not e.keep_open:
+            _pub(e, "close_panel", "")
+    else:
+        # Killed from Maestro — just signal the panel to close if configured
+        if not e.keep_open:
+            _pub(e, "close_panel", "")
 
 
 def _monitor_update_ext(e, proc):

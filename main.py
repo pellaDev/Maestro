@@ -50,6 +50,7 @@ _DEFAULT_SETTINGS: dict = {
     "openBrowserAtLaunch": False,
     "autostart":           False,
     "trayPersistent":      True,
+    "systemNotifications": True,
     "host":                "127.0.0.1",
     "port":                8865,
     "dataDir":             "",
