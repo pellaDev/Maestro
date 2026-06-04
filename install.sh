@@ -103,14 +103,21 @@ else
   ((ERRORS++))
 fi
 
-# python3-gobject (gi.repository.Gtk)
+# python3-gobject + AppIndicator3
 GTK_OK=false
-if $PY_OK && /usr/bin/python3 -c "import gi; gi.require_version('Gtk','3.0'); from gi.repository import Gtk" &>/dev/null; then
-  ok "python3-gobject (GTK)"
+if $PY_OK && /usr/bin/python3 -c "
+import gi
+gi.require_version('Gtk','3.0')
+gi.require_version('AppIndicator3','0.1')
+from gi.repository import Gtk, AppIndicator3
+" &>/dev/null; then
+  ok "python3-gobject + AppIndicator3"
   GTK_OK=true
 else
-  fail "python3-gobject missing. Install: sudo dnf install python3-gobject"
-  warn "  Ubuntu/Debian: sudo apt install python3-gi gir1.2-gtk-3.0"
+  fail "python3-gobject or AppIndicator3 missing."
+  warn "  Fedora: sudo dnf install python3-gobject libappindicator-gtk3"
+  warn "  Ubuntu: sudo apt install python3-gi gir1.2-appindicator3-0.1"
+  warn "  Also enable GNOME extension: appindicatorsupport@rgcjonas.gmail.com"
   ((ERRORS++))
 fi
 
