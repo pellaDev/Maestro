@@ -820,11 +820,18 @@ async function doLaunchAllFav(){
   showLoad();
   for(const e of entries.filter(e=>e.status==='ON'&&!e.unreachable)){
     await api('POST','/api/launch',{uid:e.uid});
-    if(!e.launchHidden&&!panels.includes(e.uid)) openPanel(e.uid);
-    else if(!panels.includes(e.uid)){panels.push(e.uid);connectSSE(e.uid);}
+    if(!panels.includes(e.uid)){
+      panels.push(e.uid);
+      if(!e.launchHidden){
+        renderGrid();_savePanels();
+      }
+      connectSSE(e.uid);
+    }
     await new Promise(r=>setTimeout(r,800));
   }
-  hideLoad();_pollSoon();
+  hideLoad();
+  // Full poll after all launches to ensure sidebar reflects final state
+  await poll();
 }
 
 async function doKillAll(){
