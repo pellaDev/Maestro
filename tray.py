@@ -1,37 +1,230 @@
 #!/usr/bin/env python3
 """
-Maestro tray.py — GTK system tray daemon (v2.0)
+Maestro tray.py — System tray daemon (v2.0)
 Path: tray.py
 
-Entry point launched by start.sh:
+Cross-platform: Linux (GTK AppIndicator3 / StatusIcon / Headless) + Windows (Win32 ctypes).
+Zero external dependencies.
+
+Launched by start.sh (Linux) or start.py (cross-platform):
     python3 tray.py --bin-dir <path>
 
-Responsibilities:
-  - Launch main.py as a subprocess (watchdog — does NOT auto-restart on crash)
-  - AppIndicator3 tray icon with Cairo dot overlay (green/red/grey)
-  - Right-click context menu via Gtk.Menu
-  - Health check loop (GET /api/state every 5s)
-  - SSE listener on /api/logs/__maestro__ → desktop notifications
-  - Autostart .desktop file management
-  - Read/write settings.json
+Linux backends (tried in order):
+  1. AppIndicator3  — preferred; requires libappindicator-gtk3
+  2. GtkStatusIcon  — GTK3 fallback; works without AppIndicator extension
+  3. Headless       — no GUI; launches main.py and prints URL to console
 
-Dependencies (all zero-pip, present on Fedora GNOME with appindicator extension):
-  gi.repository.Gtk, gi.repository.AppIndicator3, gi.repository.GLib
-  cairo — for generating dot icon PNGs
-  subprocess, threading, urllib.request — Python stdlib only
-  notify-send — libnotify
+Windows backend:
+  - Win32 ctypes: NOTIFYICONDATA message pump, GDI colored-dot icons,
+    balloon notifications, HKCU registry autostart (winreg stdlib)
+
+Notification design:
+  - Linux: notify-send subprocess called directly by this process.
+  - Windows: balloon via Shell_NotifyIcon; daemon.py's own _notify()
+    is a no-op on Windows — all notifications reach the user through
+    tray.py's SSE listener → _notify() → _notify_win32() balloon.
 """
 import argparse, json, os, shutil, subprocess, sys, tempfile, threading, time
 from pathlib import Path
 from urllib.error import URLError
 
-import gi
-gi.require_version("Gtk",          "3.0")
-gi.require_version("AppIndicator3","0.1")
-gi.require_version("GLib",         "2.0")
-from gi.repository import Gtk, AppIndicator3, GLib
+# ── Platform detection ─────────────────────────────────────────────────────────
+_WIN = sys.platform == 'win32'
 
-import cairo
+# ── Windows: imports, constants, ctypes structures, GDI icon helper ────────────
+if _WIN:
+    import ctypes, ctypes.wintypes, winreg
+
+    # Window / tray message constants
+    _WM_DESTROY       = 0x0002
+    _WM_CLOSE         = 0x0010
+    _WM_RBUTTONUP     = 0x0205
+    _WM_LBUTTONDBLCLK = 0x0203
+    _WM_APP_TRAY      = 0x8001   # WM_APP+1 — tray icon callback
+
+    # Shell_NotifyIcon operations
+    _NIM_ADD    = 0x0
+    _NIM_MODIFY = 0x1
+    _NIM_DELETE = 0x2
+
+    # NOTIFYICONDATA flags
+    _NIF_MESSAGE = 0x1
+    _NIF_ICON    = 0x2
+    _NIF_TIP     = 0x4
+    _NIF_INFO    = 0x10   # balloon tooltip
+
+    # Balloon icon type
+    _NIIF_INFO    = 0x1
+    _NIIF_NOSOUND = 0x10
+
+    # AppendMenu / TrackPopupMenu flags
+    _MF_STRING    = 0x00000000
+    _MF_SEPARATOR = 0x00000800
+    _TPM_LEFTALIGN   = 0x0000
+    _TPM_RIGHTBUTTON = 0x0002
+    _TPM_RETURNCMD   = 0x0100   # return selection instead of posting WM_COMMAND
+
+    # GDI: NULL_PEN stock object (no border on drawn shapes)
+    _NULL_PEN = 8
+
+    # Context menu item IDs
+    _ID_OPEN      = 1001
+    _ID_RESTART   = 1002
+    _ID_AUTOSTART = 1003
+    _ID_SHUTDOWN  = 1004
+
+    # WndProc function type
+    _WNDPROC_TYPE = ctypes.WINFUNCTYPE(
+        ctypes.c_long,
+        ctypes.wintypes.HWND,
+        ctypes.wintypes.UINT,
+        ctypes.wintypes.WPARAM,
+        ctypes.wintypes.LPARAM,
+    )
+
+    class _WNDCLASSEXW(ctypes.Structure):
+        _fields_ = [
+            ('cbSize',        ctypes.wintypes.UINT),
+            ('style',         ctypes.wintypes.UINT),
+            ('lpfnWndProc',   _WNDPROC_TYPE),
+            ('cbClsExtra',    ctypes.c_int),
+            ('cbWndExtra',    ctypes.c_int),
+            ('hInstance',     ctypes.wintypes.HANDLE),
+            ('hIcon',         ctypes.c_void_p),
+            ('hCursor',       ctypes.c_void_p),
+            ('hbrBackground', ctypes.c_void_p),
+            ('lpszMenuName',  ctypes.c_wchar_p),
+            ('lpszClassName', ctypes.c_wchar_p),
+            ('hIconSm',       ctypes.c_void_p),
+        ]
+
+    class _NOTIFYICONDATA(ctypes.Structure):
+        """NOTIFYICONDATAW — V2 without GUID (XP+ compatible)."""
+        _fields_ = [
+            ('cbSize',           ctypes.wintypes.DWORD),
+            ('hWnd',             ctypes.wintypes.HWND),
+            ('uID',              ctypes.wintypes.UINT),
+            ('uFlags',           ctypes.wintypes.UINT),
+            ('uCallbackMessage', ctypes.wintypes.UINT),
+            ('hIcon',            ctypes.c_void_p),
+            ('szTip',            ctypes.c_wchar * 128),
+            ('dwState',          ctypes.wintypes.DWORD),
+            ('dwStateMask',      ctypes.wintypes.DWORD),
+            ('szInfo',           ctypes.c_wchar * 256),
+            ('uVersion',         ctypes.wintypes.UINT),
+            ('szInfoTitle',      ctypes.c_wchar * 64),
+            ('dwInfoFlags',      ctypes.wintypes.DWORD),
+        ]
+
+    class _ICONINFO(ctypes.Structure):
+        _fields_ = [
+            ('fIcon',    ctypes.wintypes.BOOL),
+            ('xHotspot', ctypes.wintypes.DWORD),
+            ('yHotspot', ctypes.wintypes.DWORD),
+            ('hbmMask',  ctypes.c_void_p),   # HBITMAP
+            ('hbmColor', ctypes.c_void_p),   # HBITMAP
+        ]
+
+    class _POINT(ctypes.Structure):
+        _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
+
+    class _RECT(ctypes.Structure):
+        _fields_ = [
+            ('left',   ctypes.c_long), ('top',    ctypes.c_long),
+            ('right',  ctypes.c_long), ('bottom', ctypes.c_long),
+        ]
+
+    class _MSG(ctypes.Structure):
+        _fields_ = [
+            ('hWnd',    ctypes.wintypes.HWND),
+            ('message', ctypes.wintypes.UINT),
+            ('wParam',  ctypes.wintypes.WPARAM),
+            ('lParam',  ctypes.wintypes.LPARAM),
+            ('time',    ctypes.wintypes.DWORD),
+            ('pt',      _POINT),
+        ]
+
+    def _create_dot_hicon(dot_rgb: tuple, size: int = 16) -> int:
+        """
+        Create an HICON with a dark background and a colored dot via GDI ctypes.
+        dot_rgb: (R, G, B) as 0-255 integers. Returns an HICON handle (int).
+        The dot is placed in the bottom-right quadrant (matching the Linux Cairo icon).
+        """
+        r, g, b  = dot_rgb
+        dot_bgr  = (b << 16) | (g << 8) | r          # GDI uses BGR byte order
+        dark_bgr = (0x08 << 16) | (0x08 << 8) | 0x0E  # #0E0808 — Maestro dark bg
+
+        hdc_screen = ctypes.windll.user32.GetDC(None)
+        hdc        = ctypes.windll.gdi32.CreateCompatibleDC(hdc_screen)
+        hbm_color  = ctypes.windll.gdi32.CreateCompatibleBitmap(hdc_screen, size, size)
+        ctypes.windll.user32.ReleaseDC(None, hdc_screen)
+
+        old = ctypes.windll.gdi32.SelectObject(hdc, hbm_color)
+
+        # Fill dark background
+        bg_br = ctypes.windll.gdi32.CreateSolidBrush(dark_bgr)
+        rect  = _RECT(0, 0, size, size)
+        ctypes.windll.user32.FillRect(hdc, ctypes.byref(rect), bg_br)
+        ctypes.windll.gdi32.DeleteObject(bg_br)
+
+        # Draw colored dot (bottom-right, no outline)
+        dot_r  = max(3, size // 4)
+        cx, cy = size - dot_r - 2, size - dot_r - 2
+        dot_br = ctypes.windll.gdi32.CreateSolidBrush(dot_bgr)
+        old_br = ctypes.windll.gdi32.SelectObject(hdc, dot_br)
+        null_p = ctypes.windll.gdi32.GetStockObject(_NULL_PEN)
+        old_p  = ctypes.windll.gdi32.SelectObject(hdc, null_p)
+        ctypes.windll.gdi32.Ellipse(
+            hdc,
+            cx - dot_r, cy - dot_r,
+            cx + dot_r + 1, cy + dot_r + 1,
+        )
+        ctypes.windll.gdi32.SelectObject(hdc, old_br)
+        ctypes.windll.gdi32.SelectObject(hdc, old_p)
+        ctypes.windll.gdi32.DeleteObject(dot_br)
+
+        ctypes.windll.gdi32.SelectObject(hdc, old)
+        ctypes.windll.gdi32.DeleteDC(hdc)
+
+        # Monochrome mask: all zeros = fully opaque color bitmap
+        hbm_mask = ctypes.windll.gdi32.CreateBitmap(size, size, 1, 1, None)
+
+        ii = _ICONINFO(
+            fIcon=True, xHotspot=0, yHotspot=0,
+            hbmMask=hbm_mask, hbmColor=hbm_color,
+        )
+        hicon = ctypes.windll.user32.CreateIconIndirect(ctypes.byref(ii))
+
+        ctypes.windll.gdi32.DeleteObject(hbm_color)
+        ctypes.windll.gdi32.DeleteObject(hbm_mask)
+        return hicon
+
+    # Module-level balloon callback — set by MaestroTray._setup_win32()
+    # Used by tray.py's own _notify() to show balloon notifications.
+    # This is tray.py-internal only; daemon.py runs in a separate process.
+    _notify_win_tray_cb = None
+
+else:
+    # ── Linux: detect available GTK backend ───────────────────────────────────
+    _GTK_MODE = 'headless'
+    try:
+        import gi
+        gi.require_version("Gtk",          "3.0")
+        gi.require_version("AppIndicator3","0.1")
+        gi.require_version("GLib",         "2.0")
+        from gi.repository import Gtk, AppIndicator3, GLib
+        import cairo
+        _GTK_MODE = 'appindicator3'
+    except Exception:
+        try:
+            import gi
+            gi.require_version("Gtk",  "3.0")
+            gi.require_version("GLib", "2.0")
+            from gi.repository import Gtk, GLib
+            import cairo
+            _GTK_MODE = 'statusicon'
+        except Exception:
+            pass   # headless
 
 # ── CLI args ───────────────────────────────────────────────────────────────────
 _parser = argparse.ArgumentParser(add_help=False)
@@ -61,9 +254,10 @@ SETTINGS_FILE     = DATA_DIR / "settings.json"
 ICON_PNG          = BIN_DIR / "img" / "MaestroLogo24x24.png"
 MAIN_PY           = BIN_DIR / "main.py"
 START_SH          = BIN_DIR / "start.sh"
+START_PY          = BIN_DIR / "start.py"
 AUTOSTART_DESKTOP = Path.home() / ".config" / "autostart" / "maestro.desktop"
 
-# Temp dir for generated dot icons (created once at startup)
+# Temp dir for Cairo-generated Linux PNG tray icons
 _ICON_TMPDIR = Path(tempfile.mkdtemp(prefix="maestro_tray_"))
 
 # ── Default settings ───────────────────────────────────────────────────────────
@@ -79,6 +273,7 @@ _DEFAULT_SETTINGS = {
     "dataDir":             "",
 }
 
+
 def _load_settings() -> dict:
     s = dict(_DEFAULT_SETTINGS)
     if SETTINGS_FILE.exists():
@@ -88,6 +283,7 @@ def _load_settings() -> dict:
         except Exception:
             pass
     return s
+
 
 def _write_settings(s: dict):
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -100,23 +296,49 @@ def _write_settings(s: dict):
     except Exception as ex:
         print(f"[tray] _write_settings error: {ex}", file=sys.stderr)
 
+
 def _get_url() -> str:
     s = _load_settings()
     return f"http://{s.get('host','127.0.0.1')}:{int(s.get('port',8865))}"
 
-# ── Desktop notifications ──────────────────────────────────────────────────────
+
+# ── Notifications ──────────────────────────────────────────────────────────────
 def _notify(title: str, body: str):
-    """Best-effort notify-send. Non-blocking. Silent if systemNotifications is off."""
+    """
+    Desktop notification (best-effort, silent on failure).
+
+    Linux : notify-send subprocess.
+    Windows: balloon via tray icon (Shell_NotifyIcon NIF_INFO).
+             _notify_win_tray_cb is set by MaestroTray._setup_win32().
+             daemon.py's own _notify() is a no-op on Windows; all daemon
+             events reach the user via tray.py's SSE listener instead.
+
+    Respects the systemNotifications setting.
+    """
     if not _load_settings().get("systemNotifications", True):
         return
+    if _WIN:
+        cb = _notify_win_tray_cb
+        if cb:
+            try:
+                cb(title, body)
+            except Exception:
+                pass
+        return
+    # Linux: notify-send subprocess
     cmd = ["notify-send", title, body, "--expire-time", "4000"]
     if ICON_PNG.exists():
         cmd += ["--icon", str(ICON_PNG)]
     try:
-        subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
     except Exception:
         pass
+
 
 # ── Autostart ──────────────────────────────────────────────────────────────────
 _DESKTOP_TEMPLATE = """\
@@ -128,13 +350,54 @@ Hidden=false
 X-GNOME-Autostart-enabled=true
 """
 
+
 def _write_autostart():
-    AUTOSTART_DESKTOP.parent.mkdir(parents=True, exist_ok=True)
-    AUTOSTART_DESKTOP.write_text(_DESKTOP_TEMPLATE.format(start_sh=str(START_SH)))
+    if _WIN:
+        _write_autostart_win()
+    else:
+        AUTOSTART_DESKTOP.parent.mkdir(parents=True, exist_ok=True)
+        AUTOSTART_DESKTOP.write_text(
+            _DESKTOP_TEMPLATE.format(start_sh=str(START_SH))
+        )
+
 
 def _remove_autostart():
-    try:    AUTOSTART_DESKTOP.unlink(missing_ok=True)
-    except: pass
+    if _WIN:
+        _remove_autostart_win()
+    else:
+        try:    AUTOSTART_DESKTOP.unlink(missing_ok=True)
+        except: pass
+
+
+def _write_autostart_win():
+    """Add Maestro to Windows startup via HKCU\\...\\Run registry key."""
+    launcher = START_PY if START_PY.exists() else MAIN_PY
+    cmd_val  = f'"{sys.executable}" "{launcher}"'
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0, winreg.KEY_SET_VALUE,
+        )
+        winreg.SetValueEx(key, "Maestro", 0, winreg.REG_SZ, cmd_val)
+        winreg.CloseKey(key)
+    except Exception as ex:
+        print(f"[tray] autostart write error: {ex}", file=sys.stderr)
+
+
+def _remove_autostart_win():
+    """Remove Maestro from Windows startup registry."""
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0, winreg.KEY_SET_VALUE,
+        )
+        winreg.DeleteValue(key, "Maestro")
+        winreg.CloseKey(key)
+    except Exception:
+        pass
+
 
 def _set_autostart(enabled: bool):
     s = _load_settings()
@@ -143,38 +406,35 @@ def _set_autostart(enabled: bool):
     if enabled: _write_autostart()
     else:       _remove_autostart()
 
-# ── Icon generation with Cairo ─────────────────────────────────────────────────
-# AppIndicator3 uses file paths, not pixbufs.
-# We generate 3 small PNG files once at startup (24x24):
-# the Maestro logo background + a coloured dot bottom-right.
+
+# ── Linux icon generation (Cairo) ─────────────────────────────────────────────
+# Dot colors as Cairo float tuples (0.0–1.0); used only on Linux.
 _DOT_GREEN = (0.0,   0.902, 0.463)   # #00e676
 _DOT_RED   = (0.906, 0.298, 0.235)   # #e74c3c
 _DOT_GREY  = (0.365, 0.427, 0.494)   # #5d6d7e
 
-_ICON_PATHS: dict = {}   # state -> str path
+_ICON_PATHS: dict = {}   # state str -> abs PNG path (populated by _init_icons on Linux)
 
 
 def _generate_icon_png(dot_color: tuple, out_path: Path):
     """
-    Draw a 24x24 PNG: Maestro logo (if available) + coloured dot bottom-right.
+    Draw a 24×24 PNG: Maestro logo background + colored dot bottom-right.
     Falls back to a plain dark square if the logo PNG is missing.
+    Only called on Linux (Cairo available).
     """
-    size = 24
+    size    = 24
     surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
     ctx     = cairo.Context(surface)
 
-    # Background: try to load the logo PNG via cairo directly
     logo_loaded = False
     if ICON_PNG.exists():
         try:
-            logo_surface = cairo.ImageSurface.create_from_png(str(ICON_PNG))
-            # Scale logo to fit 24x24
-            sw = logo_surface.get_width()
-            sh = logo_surface.get_height()
+            ls = cairo.ImageSurface.create_from_png(str(ICON_PNG))
+            sw, sh = ls.get_width(), ls.get_height()
             if sw > 0 and sh > 0:
                 ctx.save()
                 ctx.scale(size / sw, size / sh)
-                ctx.set_source_surface(logo_surface, 0, 0)
+                ctx.set_source_surface(ls, 0, 0)
                 ctx.paint()
                 ctx.restore()
                 logo_loaded = True
@@ -182,19 +442,15 @@ def _generate_icon_png(dot_color: tuple, out_path: Path):
             pass
 
     if not logo_loaded:
-        # Plain dark background #0e0808
         ctx.set_source_rgb(0.055, 0.031, 0.031)
         ctx.rectangle(0, 0, size, size)
         ctx.fill()
 
-    # Dot: filled circle radius 4 at (18, 18), dark border radius 5
     r, g, b = dot_color
     cx, cy  = 18.0, 18.0
-
     ctx.arc(cx, cy, 5.0, 0, 2 * 3.14159265)
     ctx.set_source_rgba(0.055, 0.031, 0.031, 0.9)
     ctx.fill()
-
     ctx.arc(cx, cy, 4.0, 0, 2 * 3.14159265)
     ctx.set_source_rgb(r, g, b)
     ctx.fill()
@@ -203,7 +459,9 @@ def _generate_icon_png(dot_color: tuple, out_path: Path):
 
 
 def _init_icons():
-    """Generate the 3 state icon PNGs into the temp directory."""
+    """Generate the 3 state PNG icons into a temp dir. Linux-only (Cairo)."""
+    if _WIN:
+        return
     states = {
         "up":   (_DOT_GREEN, _ICON_TMPDIR / "maestro_up.png"),
         "down": (_DOT_RED,   _ICON_TMPDIR / "maestro_down.png"),
@@ -226,19 +484,86 @@ class MaestroTray:
         self._intentional_stop = False
         self._restart_pending  = False
         self._settings         = _load_settings()
+        self._headless_stop    = threading.Event()
 
-        # Build AppIndicator3
+        if _WIN:
+            self._setup_win32()
+        elif _GTK_MODE == 'appindicator3':
+            self._setup_appindicator3()
+        elif _GTK_MODE == 'statusicon':
+            self._setup_statusicon()
+        # headless: nothing to set up
+
+    # ── Backend setup ──────────────────────────────────────────────────────────
+    def _setup_appindicator3(self):
         self._ind = AppIndicator3.Indicator.new(
             "maestro",
             _ICON_PATHS.get(self.STATE_DOWN, "dialog-information"),
             AppIndicator3.IndicatorCategory.APPLICATION_STATUS,
         )
         self._ind.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
-        self._ind.set_menu(self._build_menu())
+        self._ind.set_menu(self._build_menu_gtk())
 
-    # ── Menu ───────────────────────────────────────────────────────────────────
-    def _build_menu(self) -> Gtk.Menu:
-        """Build and return the right-click context menu."""
+    def _setup_statusicon(self):
+        """GTK StatusIcon backend — works without the AppIndicator3 extension."""
+        self._si = Gtk.StatusIcon()
+        icon_path = _ICON_PATHS.get(self.STATE_DOWN, '')
+        if icon_path:
+            self._si.set_from_file(icon_path)
+        self._si.set_tooltip_text("Maestro — starting…")
+        self._si.set_visible(True)
+        self._si.connect("popup-menu", self._on_popup_statusicon)
+        self._si.connect("activate",   lambda *a: self._open_browser())
+
+    def _setup_win32(self):
+        """
+        Register a Win32 window class, create a hidden message window,
+        add the tray icon via Shell_NotifyIcon, and pre-generate GDI icons.
+        """
+        global _notify_win_tray_cb
+
+        self._cls_name = f"MaestroTrayWnd_{os.getpid()}"
+
+        # Keep WndProc reference alive to prevent GC
+        self._wndproc_ref = _WNDPROC_TYPE(self._wndproc)
+
+        wc = _WNDCLASSEXW()
+        wc.cbSize        = ctypes.sizeof(wc)
+        wc.lpfnWndProc   = self._wndproc_ref
+        wc.hInstance     = ctypes.windll.kernel32.GetModuleHandleW(None)
+        wc.lpszClassName = self._cls_name
+        ctypes.windll.user32.RegisterClassExW(ctypes.byref(wc))
+
+        # Hidden message-only window (no visible window, just a message target)
+        self._hwnd = ctypes.windll.user32.CreateWindowExW(
+            0, self._cls_name, "Maestro", 0,
+            0, 0, 0, 0, None, None, wc.hInstance, None,
+        )
+
+        # Pre-create GDI HICON for each state (colors match Linux Cairo dots)
+        self._hicons = {
+            self.STATE_UP:   _create_dot_hicon((0,   230, 118)),   # #00e676 green
+            self.STATE_DOWN: _create_dot_hicon((231, 76,  60)),    # #e74c3c red
+            self.STATE_OFF:  _create_dot_hicon((93,  109, 126)),   # #5d6d7e grey
+        }
+
+        # Add tray icon
+        nid = _NOTIFYICONDATA()
+        nid.cbSize           = ctypes.sizeof(nid)
+        nid.hWnd             = self._hwnd
+        nid.uID              = 1
+        nid.uFlags           = _NIF_MESSAGE | _NIF_ICON | _NIF_TIP
+        nid.uCallbackMessage = _WM_APP_TRAY
+        nid.hIcon            = self._hicons[self.STATE_DOWN]
+        nid.szTip            = "Maestro — starting…"
+        ctypes.windll.shell32.Shell_NotifyIconW(_NIM_ADD, ctypes.byref(nid))
+
+        # Register balloon callback for tray.py's own _notify()
+        _notify_win_tray_cb = self._notify_win32
+
+    # ── GTK menu (Linux) ───────────────────────────────────────────────────────
+    def _build_menu_gtk(self) -> 'Gtk.Menu':
+        """Build and return the right-click GTK context menu."""
         self._settings = _load_settings()
         menu = Gtk.Menu()
 
@@ -246,15 +571,15 @@ class MaestroTray:
         item_open.connect("activate", lambda _: self._open_browser())
         menu.append(item_open)
 
-        label_restart = "⚠ Restart to apply changes" if self._restart_pending else "Restart Maestro"
-        item_restart = Gtk.MenuItem(label=label_restart)
+        label_r = "⚠ Restart to apply changes" if self._restart_pending else "Restart Maestro"
+        item_restart = Gtk.MenuItem(label=label_r)
         item_restart.connect("activate", lambda _: self._restart())
         menu.append(item_restart)
 
         menu.append(Gtk.SeparatorMenuItem())
 
-        autostart_on = self._settings.get("autostart", False)
-        item_auto = Gtk.MenuItem(label=f"Autostart with OS: {'ON' if autostart_on else 'OFF'}")
+        auto_on   = self._settings.get("autostart", False)
+        item_auto = Gtk.MenuItem(label=f"Autostart with OS: {'ON' if auto_on else 'OFF'}")
         item_auto.connect("activate", lambda _: self._toggle_autostart())
         menu.append(item_auto)
 
@@ -267,23 +592,136 @@ class MaestroTray:
         menu.show_all()
         return menu
 
+    def _on_popup_statusicon(self, icon, button, timestamp):
+        """Show the GTK context menu anchored to the StatusIcon position."""
+        menu = self._build_menu_gtk()
+        menu.popup(
+            None, None,
+            Gtk.StatusIcon.position_menu, icon,
+            button, timestamp,
+        )
+
     def _refresh_menu(self):
-        """Rebuild and re-attach the menu (called after state changes)."""
-        GLib.idle_add(lambda: self._ind.set_menu(self._build_menu()))
+        """Re-attach a fresh GTK menu (AppIndicator3 only; StatusIcon builds on popup)."""
+        if _GTK_MODE == 'appindicator3':
+            GLib.idle_add(lambda: self._ind.set_menu(self._build_menu_gtk()))
+
+    # ── Win32 WndProc ──────────────────────────────────────────────────────────
+    def _wndproc(self, hwnd, msg, wparam, lparam):
+        """Win32 window procedure — handles tray callbacks and window lifecycle."""
+        if msg == _WM_APP_TRAY:
+            # Right-click or double-click on tray icon
+            if lparam in (_WM_RBUTTONUP, _WM_LBUTTONDBLCLK):
+                self._show_menu_win32()
+        elif msg == _WM_CLOSE:
+            ctypes.windll.user32.DestroyWindow(hwnd)
+        elif msg == _WM_DESTROY:
+            # Remove tray icon then exit the message loop
+            nid = _NOTIFYICONDATA()
+            nid.cbSize = ctypes.sizeof(nid)
+            nid.hWnd   = hwnd
+            nid.uID    = 1
+            ctypes.windll.shell32.Shell_NotifyIconW(_NIM_DELETE, ctypes.byref(nid))
+            ctypes.windll.user32.PostQuitMessage(0)
+        return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def _show_menu_win32(self):
+        """
+        Build and display the Win32 popup context menu at the cursor position.
+        Must be called from the message pump thread (i.e. from _wndproc).
+        Uses TPM_RETURNCMD to receive the selection without posting WM_COMMAND.
+        """
+        self._settings = _load_settings()
+        menu = ctypes.windll.user32.CreatePopupMenu()
+
+        ctypes.windll.user32.AppendMenuW(menu, _MF_STRING,    _ID_OPEN,      "Open in Browser")
+        label_r = "⚠ Restart to apply changes" if self._restart_pending else "Restart Maestro"
+        ctypes.windll.user32.AppendMenuW(menu, _MF_STRING,    _ID_RESTART,   label_r)
+        ctypes.windll.user32.AppendMenuW(menu, _MF_SEPARATOR, 0,             None)
+        auto_on = self._settings.get("autostart", False)
+        ctypes.windll.user32.AppendMenuW(
+            menu, _MF_STRING, _ID_AUTOSTART,
+            f"Autostart with OS: {'ON' if auto_on else 'OFF'}",
+        )
+        ctypes.windll.user32.AppendMenuW(menu, _MF_SEPARATOR, 0,             None)
+        ctypes.windll.user32.AppendMenuW(menu, _MF_STRING,    _ID_SHUTDOWN,  "Shut Down Maestro")
+
+        pt = _POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+        # Required before TrackPopupMenu per MSDN
+        ctypes.windll.user32.SetForegroundWindow(self._hwnd)
+
+        cmd = ctypes.windll.user32.TrackPopupMenu(
+            menu,
+            _TPM_LEFTALIGN | _TPM_RIGHTBUTTON | _TPM_RETURNCMD,
+            pt.x, pt.y, 0, self._hwnd, None,
+        )
+        ctypes.windll.user32.DestroyMenu(menu)
+
+        # Dispatch selected item in a daemon thread (keep WndProc responsive)
+        dispatch = {
+            _ID_OPEN:      self._open_browser,
+            _ID_RESTART:   self._restart,
+            _ID_AUTOSTART: self._toggle_autostart,
+            _ID_SHUTDOWN:  self._shutdown,
+        }
+        fn = dispatch.get(cmd)
+        if fn:
+            threading.Thread(target=fn, daemon=True).start()
+
+    def _notify_win32(self, title: str, body: str):
+        """
+        Show a Win32 balloon notification via Shell_NotifyIcon NIF_INFO.
+        Thread-safe — can be called from any thread.
+        """
+        if not hasattr(self, '_hwnd'):
+            return
+        nid = _NOTIFYICONDATA()
+        nid.cbSize      = ctypes.sizeof(nid)
+        nid.hWnd        = self._hwnd
+        nid.uID         = 1
+        nid.uFlags      = _NIF_INFO
+        nid.szInfo      = body[:255]
+        nid.szInfoTitle = title[:63]
+        nid.dwInfoFlags = _NIIF_INFO | _NIIF_NOSOUND
+        ctypes.windll.shell32.Shell_NotifyIconW(_NIM_MODIFY, ctypes.byref(nid))
 
     # ── Icon update ────────────────────────────────────────────────────────────
     def _update_icon(self, state: str):
+        """Update the tray icon to reflect the new state. Thread-safe on all backends."""
         self._state = state
-        icon_path   = _ICON_PATHS.get(state, _ICON_PATHS.get(self.STATE_DOWN))
-        GLib.idle_add(self._ind.set_icon_full, icon_path, f"Maestro — {state}")
+        if _WIN:
+            if not hasattr(self, '_hwnd'):
+                return
+            nid = _NOTIFYICONDATA()
+            nid.cbSize = ctypes.sizeof(nid)
+            nid.hWnd   = self._hwnd
+            nid.uID    = 1
+            nid.uFlags = _NIF_ICON | _NIF_TIP
+            nid.hIcon  = self._hicons.get(state, self._hicons[self.STATE_DOWN])
+            nid.szTip  = f"Maestro — {state}"
+            ctypes.windll.shell32.Shell_NotifyIconW(_NIM_MODIFY, ctypes.byref(nid))
+        elif _GTK_MODE == 'appindicator3':
+            icon_path = _ICON_PATHS.get(state, _ICON_PATHS.get(self.STATE_DOWN))
+            GLib.idle_add(self._ind.set_icon_full, icon_path, f"Maestro — {state}")
+        elif _GTK_MODE == 'statusicon':
+            icon_path = _ICON_PATHS.get(state, _ICON_PATHS.get(self.STATE_DOWN))
+            GLib.idle_add(self._si.set_from_file, icon_path)
+            GLib.idle_add(self._si.set_tooltip_text, f"Maestro — {state}")
+        # headless: state change is silent (URL still accessible in browser)
 
     # ── Actions ────────────────────────────────────────────────────────────────
     def _open_browser(self):
         try:
-            subprocess.Popen(["xdg-open", _get_url()],
-                             stdin=subprocess.DEVNULL,
-                             stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
+            if _WIN:
+                os.startfile(_get_url())   # opens default browser, no shell needed
+            else:
+                subprocess.Popen(
+                    ["xdg-open", _get_url()],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
         except Exception:
             pass
 
@@ -293,7 +731,8 @@ class MaestroTray:
         _set_autostart(new_val)
         self._settings["autostart"] = new_val
         _notify("Maestro", f"Autostart {'enabled' if new_val else 'disabled'}")
-        self._refresh_menu()
+        if not _WIN:
+            self._refresh_menu()
 
     def _restart(self):
         self._intentional_stop = False
@@ -301,7 +740,8 @@ class MaestroTray:
         self._stop_main()
         time.sleep(0.5)
         self._start_main()
-        self._refresh_menu()
+        if not _WIN:
+            self._refresh_menu()
 
     def _shutdown(self):
         self._intentional_stop = True
@@ -319,17 +759,29 @@ class MaestroTray:
         self._stop_main()
         self._update_icon(self.STATE_OFF)
         _notify("Maestro", "Shut down.")
+
+        # Exit the main loop (platform-specific)
         self._settings = _load_settings()
-        if not self._settings.get("trayPersistent", True):
-            GLib.idle_add(Gtk.main_quit)
+        if _WIN:
+            if not self._settings.get("trayPersistent", True):
+                if hasattr(self, '_hwnd'):
+                    ctypes.windll.user32.PostMessageW(self._hwnd, _WM_CLOSE, 0, 0)
+            # If trayPersistent: keep message loop alive with grey icon;
+            # user can restart via tray menu.
+        elif _GTK_MODE in ('appindicator3', 'statusicon'):
+            if not self._settings.get("trayPersistent", True):
+                GLib.idle_add(Gtk.main_quit)
+        else:
+            self._headless_stop.set()
 
     # ── main.py subprocess lifecycle ───────────────────────────────────────────
     def _start_main(self):
         self._settings = _load_settings()
         cmd = [sys.executable, str(MAIN_PY), "--data-dir", str(DATA_DIR)]
         try:
-            self._main_proc = subprocess.Popen(cmd, cwd=str(BIN_DIR),
-                                               stdin=subprocess.DEVNULL)
+            self._main_proc = subprocess.Popen(
+                cmd, cwd=str(BIN_DIR), stdin=subprocess.DEVNULL,
+            )
             threading.Thread(target=self._watch_main, daemon=True).start()
             _notify("Maestro", "Starting…")
         except Exception as ex:
@@ -359,7 +811,8 @@ class MaestroTray:
             return
         rc = proc.returncode
         self._update_icon(self.STATE_DOWN)
-        _notify("Maestro", f"Stopped unexpectedly (exit {rc}). Use the tray menu to restart.")
+        _notify("Maestro",
+                f"Stopped unexpectedly (exit {rc}). Use the tray menu to restart.")
 
     # ── Health check loop ──────────────────────────────────────────────────────
     def _health_loop(self):
@@ -367,7 +820,8 @@ class MaestroTray:
         url = _get_url()
         while True:
             if self._intentional_stop:
-                time.sleep(5); continue
+                time.sleep(5)
+                continue
             try:
                 with urllib.request.urlopen(f"{url}/api/state", timeout=3) as resp:
                     resp.read()
@@ -380,13 +834,13 @@ class MaestroTray:
 
     # ── SSE log listener ───────────────────────────────────────────────────────
     _SSE_FILTERS = [
-        ("▶ Started",       lambda line: ("Maestro", _extract_name(line) + " started")),
-        ("⚠ Crashed",       lambda line: ("Maestro", _extract_name(line) + " crashed")),
-        ("↺ Auto-restart",  lambda line: ("Maestro", _extract_name(line) + " restarting…")),
-        ("[UPDATE]",        lambda line: ("Maestro", "Update: " + line.split("]", 2)[-1].strip())),
-        ("File logging",    lambda line: ("Maestro", line.split("] ", 1)[-1].strip())),
-        ("Script not found",lambda line: ("Maestro", line.split("] ", 1)[-1].strip())),
-        ("Script restored", lambda line: ("Maestro", line.split("] ", 1)[-1].strip())),
+        ("▶ Started",        lambda line: ("Maestro", _extract_name(line) + " started")),
+        ("⚠ Crashed",        lambda line: ("Maestro", _extract_name(line) + " crashed")),
+        ("↺ Auto-restart",   lambda line: ("Maestro", _extract_name(line) + " restarting…")),
+        ("[UPDATE]",         lambda line: ("Maestro", "Update: " + line.split("]", 2)[-1].strip())),
+        ("File logging",     lambda line: ("Maestro", line.split("] ", 1)[-1].strip())),
+        ("Script not found", lambda line: ("Maestro", line.split("] ", 1)[-1].strip())),
+        ("Script restored",  lambda line: ("Maestro", line.split("] ", 1)[-1].strip())),
     ]
 
     def _sse_loop(self):
@@ -394,18 +848,22 @@ class MaestroTray:
         url = _get_url()
         while True:
             if self._intentional_stop:
-                time.sleep(5); continue
+                time.sleep(5)
+                continue
             try:
                 req = urllib.request.Request(f"{url}/api/logs/__maestro__")
                 with urllib.request.urlopen(req, timeout=None) as resp:
                     buf = b""
                     while True:
                         chunk = resp.read(256)
-                        if not chunk: break
+                        if not chunk:
+                            break
                         buf += chunk
                         while b"\n\n" in buf:
                             msg, buf = buf.split(b"\n\n", 1)
-                            self._handle_sse_message(msg.decode("utf-8", errors="replace"))
+                            self._handle_sse_message(
+                                msg.decode("utf-8", errors="replace")
+                            )
             except Exception:
                 time.sleep(5)
 
@@ -425,6 +883,39 @@ class MaestroTray:
                     pass
                 break
 
+    # ── Platform-specific main loops ───────────────────────────────────────────
+    def _run_win32(self):
+        """Win32 message loop (blocking). Exits on WM_QUIT (PostQuitMessage)."""
+        msg = _MSG()
+        while ctypes.windll.user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+            ctypes.windll.user32.TranslateMessage(ctypes.byref(msg))
+            ctypes.windll.user32.DispatchMessageW(ctypes.byref(msg))
+        # Destroy GDI icon handles
+        for hicon in self._hicons.values():
+            try:
+                ctypes.windll.user32.DestroyIcon(hicon)
+            except Exception:
+                pass
+
+    def _run_headless(self):
+        """
+        No tray GUI available — keep main.py alive until SIGINT / SIGTERM.
+        Prints the UI URL to stdout so the user can find it.
+        """
+        import signal as _sig
+        try:
+            _sig.signal(_sig.SIGTERM, lambda s, f: self._headless_stop.set())
+            _sig.signal(_sig.SIGINT,  lambda s, f: self._headless_stop.set())
+        except Exception:
+            pass
+        print(f"[maestro] Tray not available. Open: {_get_url()}", flush=True)
+        print("[maestro] Send SIGINT (Ctrl+C) or SIGTERM to stop.", flush=True)
+        try:
+            self._headless_stop.wait()
+        except KeyboardInterrupt:
+            pass
+        self._shutdown()
+
     # ── Entry point ────────────────────────────────────────────────────────────
     def run(self):
         self._start_main()
@@ -436,13 +927,20 @@ class MaestroTray:
                 self._open_browser()
             threading.Thread(target=_open_later, daemon=True).start()
 
-        if self._settings.get("autostart", False) and not AUTOSTART_DESKTOP.exists():
+        # Linux autostart .desktop sync (Windows uses registry, handled by _set_autostart)
+        if not _WIN and self._settings.get("autostart", False) \
+                and not AUTOSTART_DESKTOP.exists():
             _write_autostart()
 
         threading.Thread(target=self._health_loop, daemon=True).start()
         threading.Thread(target=self._sse_loop,    daemon=True).start()
 
-        Gtk.main()
+        if _WIN:
+            self._run_win32()
+        elif _GTK_MODE in ('appindicator3', 'statusicon'):
+            Gtk.main()
+        else:
+            self._run_headless()
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -451,7 +949,7 @@ def _extract_name(line: str) -> str:
     m = re.search(r"\[([^\]]+)\]", line)
     if m:
         rest = line[m.end():]
-        m2 = re.search(r"\[([^\]]+)\]", rest)
+        m2   = re.search(r"\[([^\]]+)\]", rest)
         if m2: return m2.group(1)
         return m.group(1)
     return ""
@@ -463,15 +961,17 @@ import urllib.request
 def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Generate tray icon PNGs before Gtk.main()
-    _init_icons()
+    # Generate Cairo PNG icons (Linux only; Windows uses GDI icons at runtime)
+    if not _WIN:
+        _init_icons()
 
-    # Autostart .desktop consistency
-    s = _load_settings()
-    if s.get("autostart", False) and not AUTOSTART_DESKTOP.exists():
-        _write_autostart()
-    elif not s.get("autostart", False) and AUTOSTART_DESKTOP.exists():
-        _remove_autostart()
+    # Linux autostart .desktop consistency check
+    if not _WIN:
+        s = _load_settings()
+        if s.get("autostart", False) and not AUTOSTART_DESKTOP.exists():
+            _write_autostart()
+        elif not s.get("autostart", False) and AUTOSTART_DESKTOP.exists():
+            _remove_autostart()
 
     tray = MaestroTray()
     tray.run()

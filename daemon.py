@@ -12,14 +12,30 @@ Responsibilities:
   - System and per-process metrics
   - Config read/write (config.txt)
   - Unreachable entry detection (path missing on disk)
-  - Desktop notifications via notify-send
+  - Desktop notifications (Linux: notify-send; Windows: tray callback)
 
+Cross-platform: Linux + Windows via ctypes, zero external dependencies.
 main.py owns HTTP routing and serves UI files.
 daemon.py owns all process state.
 """
 import collections, json, os, queue, re, shutil
 import signal, subprocess, sys, tempfile, threading, time, traceback, uuid
 from pathlib import Path
+
+# ── Platform ───────────────────────────────────────────────────────────────────
+_WIN = sys.platform == 'win32'
+
+if _WIN:
+    import ctypes
+    import ctypes.wintypes
+    # Process creation flags (Windows, used only inside _WIN code paths)
+    _CF_NO_WINDOW   = 0x08000000   # CREATE_NO_WINDOW  — background proc, no console flash
+    _CF_NEW_CONSOLE = 0x00000010   # CREATE_NEW_CONSOLE — visible window for external procs
+    # Process access rights
+    _PROC_QUERY     = 0x0400       # PROCESS_QUERY_INFORMATION
+    _PROC_VM_READ   = 0x0010       # PROCESS_VM_READ
+    _PROC_TERMINATE = 0x0001       # PROCESS_TERMINATE
+    _STILL_ACTIVE   = 259          # GetExitCodeProcess sentinel: process is running
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 MAESTRO_UID  = "__maestro__"
@@ -35,11 +51,51 @@ _NUM_CPUS = max(1, os.cpu_count() or 1)
 
 _ANSI = re.compile(r"\x1b(?:\[[0-9;]*[mGKHFA-Za-z]|\][^\x07]*\x07|[()][AB012])")
 
+# ── Windows ctypes structures (defined only when _WIN is True) ─────────────────
+if _WIN:
+    class _FILETIME(ctypes.Structure):
+        """Windows FILETIME: 100-nanosecond intervals since Jan 1, 1601."""
+        _fields_ = [
+            ('dwLowDateTime',  ctypes.wintypes.DWORD),
+            ('dwHighDateTime', ctypes.wintypes.DWORD),
+        ]
+
+    def _ft_int(ft: '_FILETIME') -> int:
+        """Convert FILETIME to a plain integer (100 ns ticks)."""
+        return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+
+    class _PMC(ctypes.Structure):
+        """PROCESS_MEMORY_COUNTERS (psapi.h) — WorkingSetSize gives RSS."""
+        _fields_ = [
+            ('cb',                          ctypes.wintypes.DWORD),
+            ('PageFaultCount',              ctypes.wintypes.DWORD),
+            ('PeakWorkingSetSize',           ctypes.c_size_t),
+            ('WorkingSetSize',               ctypes.c_size_t),
+            ('QuotaPeakPagedPoolUsage',      ctypes.c_size_t),
+            ('QuotaPagedPoolUsage',          ctypes.c_size_t),
+            ('QuotaPeakNonPagedPoolUsage',   ctypes.c_size_t),
+            ('QuotaNonPagedPoolUsage',       ctypes.c_size_t),
+            ('PagefileUsage',                ctypes.c_size_t),
+            ('PeakPagefileUsage',            ctypes.c_size_t),
+        ]
+
+    class _MSX(ctypes.Structure):
+        """MEMORYSTATUSEX (sysinfoapi.h) — system-wide RAM."""
+        _fields_ = [
+            ('dwLength',                ctypes.wintypes.DWORD),
+            ('dwMemoryLoad',            ctypes.wintypes.DWORD),
+            ('ullTotalPhys',            ctypes.c_uint64),
+            ('ullAvailPhys',            ctypes.c_uint64),
+            ('ullTotalPageFile',        ctypes.c_uint64),
+            ('ullAvailPageFile',        ctypes.c_uint64),
+            ('ullTotalVirtual',         ctypes.c_uint64),
+            ('ullAvailVirtual',         ctypes.c_uint64),
+            ('ullAvailExtendedVirtual', ctypes.c_uint64),
+        ]
+
 # ── Path variables (set by init()) ────────────────────────────────────────────
-# These are None until init() is called. No function that uses them
-# should be invoked before init().
-_BASE_DIR   = None   # bin/  — script assets, img/, ui files
-_DATA_DIR   = None   # data/ — config.txt, logs/, settings.json
+_BASE_DIR   = None
+_DATA_DIR   = None
 CONFIG_FILE = None
 LOG_DIR     = None
 GLOBAL_LOG  = None
@@ -50,7 +106,7 @@ def init(base_dir: Path, data_dir: Path):
     Initialize path constants. Must be the first call from main.py.
 
     Args:
-        base_dir: directory containing the daemon/main/ui source files (bin/)
+        base_dir: directory containing source files (bin/)
         data_dir: directory for user data: config.txt, logs/, settings.json (data/)
     """
     global _BASE_DIR, _DATA_DIR, CONFIG_FILE, LOG_DIR, GLOBAL_LOG
@@ -72,8 +128,11 @@ _self_buf        = collections.deque(maxlen=BUF_LINES)
 _self_subs: list = []
 _self_subs_lock  = threading.Lock()
 
-_sys_cpu         = 0.0
-_prev_cpu_stat   = None   # (total_jiffies, idle_jiffies) from last /proc/stat read
+_sys_cpu       = 0.0
+_prev_cpu_stat = None   # platform-specific: (total, idle) on Linux; (idle_t, total_t) on Windows
+
+# Windows bash path cache: Ellipsis = unchecked; None = not found; str = found path
+_bash_win_cache = ...
 
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -174,7 +233,7 @@ class ProcessEntry:
         self.log_buf   = collections.deque(maxlen=BUF_LINES)
         self.subs      = []               # list[queue.Queue] — live SSE clients
         self.metrics   = {"cpu": 0.0, "ram": 0}
-        self._cpu_prev = None             # (total_jiffies, monotonic_time) for delta CPU
+        self._cpu_prev = None             # platform-specific CPU delta state
 
     def display_name(self) -> str:
         if self.name:
@@ -221,6 +280,19 @@ class ProcessEntry:
 
 # ── PID check ──────────────────────────────────────────────────────────────────
 def _pid_alive(pid: int) -> bool:
+    """Return True if the given PID is a live, non-zombie process."""
+    if _WIN:
+        try:
+            h = ctypes.windll.kernel32.OpenProcess(_PROC_QUERY, False, pid)
+            if not h:
+                return False
+            code = ctypes.wintypes.DWORD()
+            ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+            ctypes.windll.kernel32.CloseHandle(h)
+            return code.value == _STILL_ACTIVE
+        except Exception:
+            return False
+    # Linux: /proc/<pid>/status
     try:
         for line in Path(f"/proc/{pid}/status").read_text().splitlines():
             if line.startswith("State:"):
@@ -354,7 +426,15 @@ def _close_subs(e):
 
 # ── Metrics ────────────────────────────────────────────────────────────────────
 def _update_metrics(e):
-    """Update per-process CPU% and RSS from /proc. Requires e.pid to be set."""
+    """Update per-process CPU% and RAM. Dispatches to platform implementation."""
+    if _WIN:
+        _update_metrics_win(e)
+    else:
+        _update_metrics_linux(e)
+
+
+def _update_metrics_linux(e):
+    """Linux: read CPU/RAM from /proc/<pid>/stat and /proc/<pid>/status."""
     pid = e.pid
     if pid is None:
         e.metrics   = {"cpu": 0.0, "ram": 0}
@@ -380,9 +460,77 @@ def _update_metrics(e):
         e._cpu_prev = None
 
 
+def _update_metrics_win(e):
+    """
+    Windows: per-process CPU% via GetProcessTimes and RAM via K32GetProcessMemoryInfo.
+    All via ctypes kernel32 — zero external dependencies.
+    """
+    pid = e.pid
+    if pid is None:
+        e.metrics   = {"cpu": 0.0, "ram": 0}
+        e._cpu_prev = None
+        return
+    h = ctypes.windll.kernel32.OpenProcess(_PROC_QUERY | _PROC_VM_READ, False, pid)
+    if not h:
+        e.metrics   = {"cpu": 0.0, "ram": 0}
+        e._cpu_prev = None
+        return
+    try:
+        # CPU: delta of (kernel + user) FILETIME ticks (100 ns each)
+        ct = _FILETIME(); et = _FILETIME()
+        kt = _FILETIME(); ut = _FILETIME()
+        ctypes.windll.kernel32.GetProcessTimes(
+            h, ctypes.byref(ct), ctypes.byref(et),
+            ctypes.byref(kt), ctypes.byref(ut),
+        )
+        proc_ticks = _ft_int(kt) + _ft_int(ut)
+        now = time.monotonic()
+        raw = 0.0
+        if e._cpu_prev:
+            prev_ticks, prev_now = e._cpu_prev
+            delta_s     = max(now - prev_now, 0.001)
+            delta_ticks = proc_ticks - prev_ticks
+            raw = (delta_ticks / 1e7) / delta_s * 100 / _NUM_CPUS
+        e._cpu_prev = (proc_ticks, now)
+
+        # RAM: WorkingSetSize (physical RAM in bytes)
+        pmc = _PMC()
+        pmc.cb = ctypes.sizeof(pmc)
+        if ctypes.windll.kernel32.K32GetProcessMemoryInfo(h, ctypes.byref(pmc), pmc.cb):
+            ram_mb = pmc.WorkingSetSize >> 20
+        else:
+            ram_mb = 0
+
+        e.metrics = {"cpu": round(raw, 1), "ram": ram_mb}
+    except Exception:
+        e.metrics   = {"cpu": 0.0, "ram": 0}
+        e._cpu_prev = None
+    finally:
+        ctypes.windll.kernel32.CloseHandle(h)
+
+
 def _read_sys_cpu():
-    """Update _sys_cpu global from /proc/stat delta (system-wide percentage)."""
+    """Update _sys_cpu global from system-wide CPU delta."""
     global _sys_cpu, _prev_cpu_stat
+    if _WIN:
+        try:
+            idle = _FILETIME(); kernel = _FILETIME(); user = _FILETIME()
+            ctypes.windll.kernel32.GetSystemTimes(
+                ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
+            )
+            idle_t  = _ft_int(idle)
+            total_t = _ft_int(kernel) + _ft_int(user)
+            if _prev_cpu_stat is not None:
+                pi, pt  = _prev_cpu_stat
+                d_idle  = idle_t  - pi
+                d_total = total_t - pt
+                if d_total > 0:
+                    _sys_cpu = round((1.0 - d_idle / d_total) * 100, 1)
+            _prev_cpu_stat = (idle_t, total_t)
+        except Exception:
+            pass
+        return
+    # Linux: /proc/stat delta
     try:
         line  = Path("/proc/stat").read_text().splitlines()[0]
         vals  = list(map(int, line.split()[1:]))
@@ -402,7 +550,18 @@ def _read_sys_cpu():
 
 
 def _read_sys_ram() -> tuple:
-    """Return (used_mb, total_mb) from /proc/meminfo."""
+    """Return (used_mb, total_mb) for system RAM."""
+    if _WIN:
+        try:
+            stat = _MSX()
+            stat.dwLength = ctypes.sizeof(stat)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            total_mb = stat.ullTotalPhys >> 20
+            avail_mb = stat.ullAvailPhys >> 20
+            return total_mb - avail_mb, total_mb
+        except Exception:
+            return 0, 0
+    # Linux: /proc/meminfo
     try:
         info = {}
         for line in Path("/proc/meminfo").read_text().splitlines():
@@ -421,7 +580,9 @@ def _read_sys_ram() -> tuple:
 
 
 def _read_gpu() -> dict:
-    """Read AMD GPU utilization and VRAM from sysfs. Returns zeros on failure."""
+    """AMD GPU stats from Linux sysfs. Returns zeros on Windows or on failure."""
+    if _WIN:
+        return {"gpu": 0, "vramUsed": 0, "vramTotal": 0}
     try:
         for card in sorted(Path("/sys/class/drm").iterdir()):
             if not card.name.startswith("card") or "_" in card.name:
@@ -439,12 +600,16 @@ def _read_gpu() -> dict:
     return {"gpu": 0, "vramUsed": 0, "vramTotal": 0}
 
 
-# ── Unreachable entry state ────────────────────────────────────────────────────
+# ── Notifications ──────────────────────────────────────────────────────────────
 def _notify(title: str, body: str):
     """
-    Send a desktop notification via notify-send.
-    Non-blocking, best-effort — silently ignored if notify-send is unavailable.
+    Desktop notification.
+    Linux: notify-send subprocess (best-effort, silent if absent).
+    Windows: no-op — daemon.py runs in a separate process from the tray; all
+    notifications reach the user via tray.py's SSE listener → balloon instead.
     """
+    if _WIN:
+        return
     icon = str(_BASE_DIR / "img" / "MaestroLogo24x24.png") if _BASE_DIR else ""
     cmd  = ["notify-send", title, body, "--expire-time", "4000"]
     if icon and Path(icon).exists():
@@ -457,13 +622,14 @@ def _notify(title: str, body: str):
             stderr=subprocess.DEVNULL,
         )
     except Exception:
-        pass   # notify-send absent or failed — non-fatal
+        pass
 
 
+# ── Unreachable entry state ────────────────────────────────────────────────────
 def _check_paths():
     """
     Check all non-SEP entries for path reachability via os.path.isfile().
-    Fires a one-shot notify-send on each reachable↔unreachable transition.
+    Fires a one-shot notification on each reachable↔unreachable transition.
     Called from _metrics_loop every cycle (~2s). Single-writer — no extra lock needed.
     """
     with _lock:
@@ -472,7 +638,7 @@ def _check_paths():
         was         = e.unreachable
         now_missing = not os.path.isfile(e.path)
         if now_missing == was:
-            continue   # no transition — nothing to do
+            continue
         e.unreachable = now_missing
         if now_missing:
             _mlog(f"[{e.display_name()}] ⚠ Script not found: {e.path}")
@@ -484,7 +650,43 @@ def _check_paths():
                     f"{e.display_name()} — {e.path}")
 
 
+# ── Windows bash detection ─────────────────────────────────────────────────────
+def _get_bash_win():
+    """
+    Find and cache bash on Windows. Checks PATH, WSL bash.exe, and Git Bash.
+    Returns the executable path (str) or None if not found.
+    Only called when _WIN is True.
+    """
+    global _bash_win_cache
+    if _bash_win_cache is not ...:
+        return _bash_win_cache
+    candidates = [
+        'bash',                                          # PATH (WSL, Git Bash if configured)
+        r'C:\Windows\System32\bash.exe',                 # WSL
+        r'C:\Program Files\Git\bin\bash.exe',            # Git Bash (64-bit)
+        r'C:\Program Files (x86)\Git\bin\bash.exe',      # Git Bash (32-bit)
+    ]
+    found = None
+    for c in candidates:
+        try:
+            r = subprocess.run(
+                [c, '--version'],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            if r.returncode == 0:
+                found = c
+                break
+        except Exception:
+            continue
+    _bash_win_cache = found
+    return found
+
+
 # ── External terminal helpers ─────────────────────────────────────────────────
+# Linux terminal candidates (tried in order)
 _EXT_CANDIDATES = [
     lambda s, cwd: (["gnome-terminal", "--wait", "--", "bash", "-c", s],   {"cwd": cwd}),
     lambda s, cwd: (["xfce4-terminal", "--hold", "-e", f"bash -c '{s}'"],  {"cwd": cwd}),
@@ -501,33 +703,100 @@ def _kill_ext(e):
     Clears e.ext_proc before sending the signal to avoid _monitor_external races.
     """
     proc       = e.ext_proc
-    e.ext_proc = None   # clear first so monitors see it immediately
+    e.ext_proc = None
     if not proc or proc.poll() is not None:
         return
-    try:
-        pgid = os.getpgid(proc.pid)
-        os.killpg(pgid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
-        try:    proc.terminate()
-        except Exception: pass
+    if _WIN:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        def _force():
+            time.sleep(2.0)
+            if proc.poll() is None:
+                try:    proc.kill()
+                except: pass
+        threading.Thread(target=_force, daemon=True).start()
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:    proc.terminate()
+            except: pass
 
-    def _force_kill():
-        time.sleep(2.0)
-        if proc.poll() is None:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except Exception:
-                pass
-    threading.Thread(target=_force_kill, daemon=True).start()
+        def _force():
+            time.sleep(2.0)
+            if proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+        threading.Thread(target=_force, daemon=True).start()
+
+
+def _run_in_external_terminal_win(e, script_path: str, label: str):
+    """
+    Windows: launch a script in a visible terminal window.
+    Tries Windows Terminal (wt.exe) first, then bash with CREATE_NEW_CONSOLE.
+    Requires bash (WSL or Git Bash) — logs an error and returns None if absent.
+    _kill_ext(e) is assumed to have already been called by the caller.
+    """
+    bash = _get_bash_win()
+    if not bash:
+        _append_log(e,
+            "[MAESTRO] ✕ No bash found — install WSL or Git Bash to launch scripts")
+        _mlog(f"[{e.display_name()}] ✕ No bash found (WSL / Git Bash required)")
+        return None
+
+    tail    = 'echo ""; echo "--- Done (exit: $?) ---"; read -p "Press Enter to close..."'
+    cmd_str = f'bash "{script_path}"; {tail}'
+    cwd     = str(Path(script_path).parent)
+
+    # Candidates: Windows Terminal (best UX), then bash with a new console window
+    candidates = [
+        (['wt.exe', '-d', cwd, bash, '-c', cmd_str], {}),
+        ([bash, '-c', cmd_str], {'cwd': cwd, 'creationflags': _CF_NEW_CONSOLE}),
+    ]
+
+    for cmd, kwargs in candidates:
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                **kwargs,
+            )
+            with _lock:
+                e.ext_proc = proc
+            _append_log(e,
+                f"[MAESTRO] ↗ {label} in external terminal — PID {proc.pid} ({cmd[0]})")
+            _mlog(f"[{e.display_name()}] ↗ {label}: {cmd[0]} PID {proc.pid}")
+            return proc
+        except FileNotFoundError:
+            continue
+        except Exception as ex:
+            _mlog(f"[{e.display_name()}] ✕ External {label} ({cmd[0]}): {ex}")
+            return None
+
+    _append_log(e,
+        "[MAESTRO] ✕ No terminal found — install Windows Terminal or ensure bash is in PATH")
+    _mlog(f"[{e.display_name()}] ✕ No terminal found on Windows")
+    return None
 
 
 def _run_in_external_terminal(e, script_path: str, label: str = "Launch"):
     """
-    Launch script_path in an OS terminal emulator. Tries emulators in order.
+    Launch script_path in an OS terminal emulator. Dispatches to platform implementation.
     Always calls _kill_ext(e) first to clean up any previous external terminal.
     Returns the Popen object on success, None on failure.
     """
     _kill_ext(e)
+
+    if _WIN:
+        return _run_in_external_terminal_win(e, script_path, label)
+
+    # Linux: try emulators in order
     tail    = 'echo ""; echo "--- Done (exit: $?) ---"; read -p "Press Enter to close..."'
     cmd_str = f'bash "{script_path}"; {tail}'
     cwd     = str(Path(script_path).parent)
@@ -543,7 +812,8 @@ def _run_in_external_terminal(e, script_path: str, label: str = "Launch"):
             )
             with _lock:
                 e.ext_proc = proc
-            _append_log(e, f"[MAESTRO] ↗ {label} in external terminal — PID {proc.pid} ({cmd[0]})")
+            _append_log(e,
+                f"[MAESTRO] ↗ {label} in external terminal — PID {proc.pid} ({cmd[0]})")
             _mlog(f"[{e.display_name()}] ↗ {label}: {cmd[0]} PID {proc.pid}")
             return proc
         except FileNotFoundError:
@@ -562,13 +832,20 @@ def _run_in_external_terminal(e, script_path: str, label: str = "Launch"):
 
 # ── Process management ─────────────────────────────────────────────────────────
 def _kill_proc(e):
-    """Send SIGTERM to the process group of the internal subprocess."""
-    if e.proc and e.proc.poll() is None:
+    """Send a termination signal to the internal subprocess."""
+    if not (e.proc and e.proc.poll() is None):
+        return
+    if _WIN:
+        try:
+            e.proc.terminate()   # calls TerminateProcess on Windows
+        except Exception:
+            pass
+    else:
         try:
             os.killpg(os.getpgid(e.proc.pid), signal.SIGTERM)
         except (ProcessLookupError, PermissionError, OSError):
             try:    e.proc.terminate()
-            except Exception: pass
+            except: pass
 
 
 def launch(idx: int, *, _from_restart: bool = False):
@@ -584,7 +861,7 @@ def launch(idx: int, *, _from_restart: bool = False):
     if e.status == "SEP":
         return
 
-    # Refuse launch if the script file is currently missing
+    # Refuse launch if script file is missing
     if e.unreachable:
         _mlog(f"[{e.display_name()}] ✕ Launch refused — script not found: {e.path}")
         return
@@ -594,7 +871,7 @@ def launch(idx: int, *, _from_restart: bool = False):
             e.manually_killed = True
             _kill_proc(e)
         _kill_ext(e)
-        e.crash          = False
+        e.crash           = False
         e.manually_killed = False
         e.generation     += 1
         gen               = e.generation
@@ -610,16 +887,34 @@ def launch(idx: int, *, _from_restart: bool = False):
         _launch_external(e, gen)
         return
 
-    # Internal launch
-    try:
-        proc = subprocess.Popen(
-            ["bash", e.path],
+    # Resolve bash and build platform-specific Popen kwargs
+    if _WIN:
+        bash = _get_bash_win()
+        if not bash:
+            _mlog_event(e,
+                "[MAESTRO] ✕ Launch failed — bash not found (install WSL or Git Bash)")
+            return
+        proc_cmd = [bash, e.path]
+        proc_kw  = dict(
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            text=True, bufsize=1,
+            cwd=str(Path(e.path).parent),
+            errors='replace',
+            creationflags=_CF_NO_WINDOW,   # suppress console flash on Windows
+        )
+    else:
+        proc_cmd = ['bash', e.path]
+        proc_kw  = dict(
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, start_new_session=True,
             text=True, bufsize=1,
             cwd=str(Path(e.path).parent),
-            errors="replace"
+            errors='replace',
         )
+
+    try:
+        proc = subprocess.Popen(proc_cmd, **proc_kw)
     except Exception as ex:
         _mlog_event(e, f"[MAESTRO] ✕ Launch failed: {ex}")
         return
@@ -628,7 +923,10 @@ def launch(idx: int, *, _from_restart: bool = False):
         # Check again — kill may have arrived between Popen and here
         if e.manually_killed or e.generation != gen:
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                if _WIN:
+                    proc.terminate()
+                else:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             except Exception:
                 pass
             return
@@ -669,7 +967,7 @@ def _reader(e, gen: int):
 def _monitor(e, gen: int):
     """Wait for the internal subprocess to exit. Handles crash, close_panel, auto-restart."""
     try:    e.proc.wait()
-    except Exception: pass
+    except: pass
     if e.generation != gen:
         return
     rc = e.proc.returncode
@@ -702,16 +1000,13 @@ def _monitor_external(e, proc, gen: int):
     """
     Wait for the external terminal process to exit.
     Updates e.pid and fires SSE events so the UI stays in sync.
-    Distinguishes between intentional kill (from Maestro) and manual close (user).
     """
     try:    proc.wait()
-    except Exception: pass
+    except: pass
     if e.generation != gen:
         return
-    # Determine if this exit was triggered by Maestro (kill_entry / _kill_ext)
-    intentional = e.manually_killed
     with _lock:
-        e.pid = None
+        e.pid   = None
         e.crash = False
         if e.ext_proc is proc:
             e.ext_proc = None
@@ -728,7 +1023,7 @@ def _monitor_external(e, proc, gen: int):
 def _monitor_update_ext(e, proc):
     """Wait for an update script terminal to exit and log the result."""
     try:    proc.wait()
-    except Exception: pass
+    except: pass
     if e.ext_proc is proc:
         e.ext_proc = None
     rc = proc.returncode if proc.returncode is not None else "?"
@@ -745,14 +1040,25 @@ def kill_entry(idx: int):
         e.manually_killed = True
         _kill_proc(e)
         _kill_ext(e)
-        # For open_outside scripts, also kill by PID directly —
-        # the terminal emulator may not propagate SIGTERM to the child script.
+        # For open_outside scripts, also kill the script PID directly —
+        # the terminal emulator may not propagate the signal to the child.
         if e.open_outside and e.pid is not None:
-            try:
-                os.killpg(os.getpgid(e.pid), signal.SIGTERM)
-            except (ProcessLookupError, PermissionError, OSError):
-                try:    os.kill(e.pid, signal.SIGTERM)
-                except: pass
+            if _WIN:
+                try:
+                    h = ctypes.windll.kernel32.OpenProcess(
+                        _PROC_TERMINATE, False, e.pid
+                    )
+                    if h:
+                        ctypes.windll.kernel32.TerminateProcess(h, 1)
+                        ctypes.windll.kernel32.CloseHandle(h)
+                except Exception:
+                    pass
+            else:
+                try:
+                    os.killpg(os.getpgid(e.pid), signal.SIGTERM)
+                except (ProcessLookupError, PermissionError, OSError):
+                    try:    os.kill(e.pid, signal.SIGTERM)
+                    except: pass
         e.pid   = None
         e.crash = False
         save_config()
@@ -773,7 +1079,7 @@ def kill_all():
 
 def _watch_existing_pid(e):
     """
-    Poll /proc every 5s for a PID that was already running when Maestro started.
+    Poll every 5s for a PID that was already running when Maestro started.
     Fires a crash event if the PID disappears.
     """
     pid = e.pid

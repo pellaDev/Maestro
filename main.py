@@ -8,7 +8,7 @@ Responsibilities:
   - Read/write settings.json
   - Serve ui.html, ui.js, webui.js, img/
   - HTTP API routes (delegates all process logic to daemon.py)
-  - Single-instance lock (/tmp/MaestroWeb.pid)
+  - Single-instance lock (platform temp dir / MaestroWeb.pid)
   - Graceful shutdown on SIGTERM / SIGINT
 
 Process management, SSE, config I/O → daemon.py
@@ -22,7 +22,7 @@ import daemon
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent      # bin/ — source files, img/, ui assets
-PID_FILE = Path("/tmp/MaestroWeb.pid")
+PID_FILE = Path(tempfile.gettempdir()) / "MaestroWeb.pid"
 
 IMG_DIR  = BASE_DIR / "img"
 UI_FILE  = BASE_DIR / "ui.html"
