@@ -1,6 +1,14 @@
-# Maestro
+<h1 align="center">
+  <strong><span style="color:#FFD700;">MAESTRO</span></strong>
+</h1>
 
-**Privacy-first process orchestrator for Linux and Windows.**
+<p align="center">
+  <strong><span style="color:#FF8C00;">Privacy-first process orchestrator for Linux and Windows.</span></strong>
+</p>
+
+<p align="center">
+  <img src="img/MaestroLogo.png" width="124" alt="Logo">
+</p>
 
 Maestro lets you launch, monitor, and manage shell scripts from a browser UI running entirely on localhost. No cloud, no telemetry, no external dependencies beyond the Python standard library and GTK (Linux) or Win32 (Windows).
 
