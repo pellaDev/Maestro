@@ -32,7 +32,7 @@ hdr()  { echo -e "\n${BOLD}$*${RST}"; }
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_INSTALL_DIR="${HOME}/.local/share/maestro"
+DEFAULT_INSTALL_DIR="${SCRIPT_DIR}"   # portable-first: installs inside the cloned folder
 INSTALL_DIR=""
 NO_AUTOSTART=false
 ERRORS=0
@@ -44,7 +44,7 @@ show_help() {
   echo "Usage: bash install.sh [OPTIONS]"
   echo ""
   echo "Options:"
-  echo "  --install-dir PATH   Install to PATH instead of default"
+  echo "  --install-dir PATH   Install to PATH instead of the cloned folder"
   echo "                       Default: ${DEFAULT_INSTALL_DIR}"
   echo "  --no-autostart       Skip the autostart prompt"
   echo "  --help               Show this help"

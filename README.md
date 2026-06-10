@@ -17,6 +17,14 @@ Maestro lets you launch, monitor, and manage shell scripts from a browser UI run
 
 ---
 
+> **Portable first** — clone the repo anywhere, run `bash install.sh` (Linux) or `python install.py` (Windows), and everything installs self-contained inside that same folder. No system paths touched. No scattered files. Move the folder and Maestro moves with it.
+
+---
+
+<p align="center">
+<img width="2187" height="1336" alt="Pasted image (2)" src="https://github.com/user-attachments/assets/2e512e68-db4b-416d-9d12-f9949bbc4742" />
+</p>
+
 ## What is Maestro?
 
 Maestro is a personal tool for people who run multiple background scripts on a desktop machine and want a clean way to manage them. It provides:
@@ -126,15 +134,22 @@ cd Maestro
 bash install.sh
 ```
 
+By default this installs **entirely inside the cloned folder**:
+```
+Maestro/
+├── bin/    ← source files (created by installer)
+└── data/   ← config.txt, settings.json, logs/ (created by installer)
+```
+
 The installer will:
 1. Auto-detect your distro and show exact package install commands if anything is missing
-2. Ask for an install path (default: `~/.local/share/maestro`)
-3. Create `bin/` (source files) and `data/` (config, logs, settings)
+2. Confirm the install path (default: the folder where `install.sh` lives)
+3. Create `bin/` and `data/` inside that folder
 4. Optionally enable autostart via `~/.config/autostart/maestro.desktop`
 
-Custom install path:
+Custom install path (optional — if you want bin/ and data/ somewhere else):
 ```bash
-bash install.sh --install-dir /my/path
+bash install.sh --install-dir /custom/path
 bash install.sh --no-autostart   # skip autostart prompt
 ```
 
@@ -159,14 +174,20 @@ cd Maestro
 python install.py
 ```
 
+By default this installs **entirely inside the cloned folder**:
+```
+Maestro├── bin\    ← source files (created by installer)
+└── data\   ← config.txt, settings.json, logs\ (created by installer)
+```
+
 The installer will:
 1. Check Python 3.11+ and bash availability (WSL / Git Bash)
-2. Ask for an install path (default: `%LOCALAPPDATA%\Maestro`)
-3. Create `bin\` and `data\` directories and copy all source files
+2. Confirm the install path (default: the folder where `install.py` lives)
+3. Create `bin\` and `data\` inside that folder
 4. Create `data\settings.json` with defaults
 5. Optionally enable autostart via the Windows registry (`HKCU\...\Run`)
 
-Custom install path:
+Custom install path (optional):
 ```powershell
 python install.py --install-dir C:\Tools\Maestro
 python install.py --no-autostart
@@ -298,12 +319,6 @@ Data directory path resolution order:
 
 ---
 
-## Screenshots
-
-*Coming soon.*
-
----
-
 ## License
 
 MIT License — © Michele Pella
@@ -314,7 +329,7 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 
 ## Contributing
 
-Issues and PRs welcome. Please read the developer reference (`V2_0_MAESTRO_GUIDE.md`) before contributing — it documents the full architecture, API, and coding rules.
+Issues and PRs welcome. However, all contributions are governed by the terms described in CONTRIBUTING.md. By submitting a contribution, you agree to those terms.
 
 ---
 

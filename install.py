@@ -35,7 +35,7 @@ def hdr(msg):  print(f"\n{BOLD}{msg}{RST}")
 
 # ── Args ───────────────────────────────────────────────────────────────────────
 SCRIPT_DIR          = Path(__file__).parent.resolve()
-DEFAULT_INSTALL_DIR = Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'Maestro'
+DEFAULT_INSTALL_DIR = Path(__file__).parent.resolve()  # portable-first: installs inside the cloned folder
 
 parser = argparse.ArgumentParser(
     description="Maestro Windows installer",
@@ -43,7 +43,7 @@ parser = argparse.ArgumentParser(
 )
 parser.add_argument(
     '--install-dir', default=str(DEFAULT_INSTALL_DIR),
-    help=f'Install directory (default: {DEFAULT_INSTALL_DIR})',
+    help='Install directory (default: folder containing install.py)',
 )
 parser.add_argument('--no-autostart', action='store_true',
                     help='Skip the autostart prompt')
@@ -128,8 +128,10 @@ if ERRORS > 0:
 
 # ── Confirm install path ───────────────────────────────────────────────────────
 hdr("Install path")
-info(f"bin\\   →  {BIN_DIR}")
-info(f"data\\  →  {DATA_DIR}")
+info(f"Maestro will be self-contained in:")
+info(f"  {INSTALL_DIR}")
+info(f"  ├── bin\\   (source files)")
+info(f"  └── data\\  (config, logs, settings)")
 print()
 confirm = input("  Proceed? [Y/n] ").strip() or 'Y'
 if confirm.lower() != 'y':

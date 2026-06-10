@@ -72,6 +72,7 @@ if _WIN:
     _ID_RESTART   = 1002
     _ID_AUTOSTART = 1003
     _ID_SHUTDOWN  = 1004
+    _ID_QUIT      = 1005
 
     # WndProc function type
     _WNDPROC_TYPE = ctypes.WINFUNCTYPE(
@@ -347,6 +348,7 @@ Type=Application
 Name=Maestro
 Exec=bash {start_sh}
 Hidden=false
+Terminal=false
 X-GNOME-Autostart-enabled=true
 """
 
@@ -589,6 +591,10 @@ class MaestroTray:
         item_off.connect("activate", lambda _: self._shutdown())
         menu.append(item_off)
 
+        item_quit = Gtk.MenuItem(label="Quit Maestro")
+        item_quit.connect("activate", lambda _: self._quit())
+        menu.append(item_quit)
+
         menu.show_all()
         return menu
 
@@ -645,6 +651,7 @@ class MaestroTray:
         )
         ctypes.windll.user32.AppendMenuW(menu, _MF_SEPARATOR, 0,             None)
         ctypes.windll.user32.AppendMenuW(menu, _MF_STRING,    _ID_SHUTDOWN,  "Shut Down Maestro")
+        ctypes.windll.user32.AppendMenuW(menu, _MF_STRING,    _ID_QUIT,      "Quit Maestro")
 
         pt = _POINT()
         ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
@@ -664,6 +671,7 @@ class MaestroTray:
             _ID_RESTART:   self._restart,
             _ID_AUTOSTART: self._toggle_autostart,
             _ID_SHUTDOWN:  self._shutdown,
+            _ID_QUIT:      self._quit,
         }
         fn = dispatch.get(cmd)
         if fn:
@@ -774,8 +782,47 @@ class MaestroTray:
         else:
             self._headless_stop.set()
 
+    def _quit(self):
+        """Quit Maestro entirely: stops main.py AND exits the tray. Ignores trayPersistent."""
+        self._intentional_stop = True
+        url = _get_url()
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                f"{url}/api/shutdown", data=b"{}",
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            urllib.request.urlopen(req, timeout=3)
+        except Exception:
+            pass
+        time.sleep(1.0)
+        self._stop_main()
+        self._update_icon(self.STATE_OFF)
+        _notify("Maestro", "Quit.")
+        # Always exit the tray loop — ignores trayPersistent
+        if _WIN:
+            if hasattr(self, '_hwnd'):
+                ctypes.windll.user32.PostMessageW(self._hwnd, _WM_CLOSE, 0, 0)
+        elif _GTK_MODE in ('appindicator3', 'statusicon'):
+            GLib.idle_add(Gtk.main_quit)
+        else:
+            self._headless_stop.set()
+
     # ── main.py subprocess lifecycle ───────────────────────────────────────────
     def _start_main(self):
+        # Gracefully stop any orphaned main.py from a previous force-close.
+        # When tray.py is killed hard, main.py can survive as an orphan on port 8865.
+        url = _get_url()
+        try:
+            import urllib.request as _ur
+            _ur.urlopen(_ur.Request(
+                f"{url}/api/shutdown", data=b"{}",
+                headers={"Content-Type": "application/json"}, method="POST",
+            ), timeout=2)
+            time.sleep(0.8)
+        except Exception:
+            pass   # nothing orphaned — proceed normally
+
         self._settings = _load_settings()
         cmd = [sys.executable, str(MAIN_PY), "--data-dir", str(DATA_DIR)]
         try:
