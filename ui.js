@@ -24,6 +24,17 @@ let _sysCpu=0,_sysRam=0,_sysRamTotal=0;
 let _gpu={gpu:0,vramUsed:0,vramTotal:0};
 const _tabReady=new Set();
 
+// ── Stale connection watchdog state ─────────────────────────────────────────────
+// Chromium (and Chromium-based browsers like Brave) throttles or pauses timers
+// on background tabs regardless of Memory Saver settings, since it targets any
+// non-focused tab. This silently stalls poll() and can drop SSE connections,
+// making the UI look "frozen" (clicks on Launch/Kill appear to do nothing) until
+// the page is manually refreshed. This watchdog detects the stall and recovers.
+const STALE_MS = 6000;           // ms without a successful poll before we consider the UI stale
+let _lastPollOk = Date.now();    // timestamp of the last successful /api/state response
+let _lastPollNetErr = false;     // true = last poll failed with a real fetch error; false = just stale (throttled timer)
+let _staleActive = false;        // guards against overlapping reconnect attempts
+
 let _widePanels={};
 try{ _widePanels=JSON.parse(localStorage.getItem('tpw')||'{}'); }catch{}
 function _saveWide(){ try{localStorage.setItem('tpw',JSON.stringify(_widePanels));}catch{} }
@@ -36,7 +47,10 @@ function _savePanels(){ try{sessionStorage.setItem('mp',JSON.stringify(panels));
 function _loadPanels(){ try{const p=sessionStorage.getItem('mp');if(p)panels=JSON.parse(p);}catch{} }
 _loadPanels();
 
-document.addEventListener('visibilitychange',()=>{ _pageVisible=!document.hidden; if(_pageVisible)poll(); });
+document.addEventListener('visibilitychange',()=>{
+  _pageVisible=!document.hidden;
+  if(_pageVisible){ poll(); _checkStale(); }
+});
 
 // DOM refs needed by poll callbacks — must be initialized before any async poll result
 const fQ=document.getElementById('ftr-quote');
@@ -99,6 +113,7 @@ function _mkHash(es){
 
 async function poll(){
   const d=await api('GET','/api/state');
+  if(d&&d.entries){ _lastPollOk=Date.now(); _lastPollNetErr=false; } else { _lastPollNetErr=true; }
   if(!d||!d.entries) return;
   entries=d.entries;
   if(d.loggingEnabled!==undefined) _loggingEnabled=d.loggingEnabled;
@@ -173,6 +188,7 @@ function _pollSoon(){
 // Use after batch operations where daemon state may lag behind.
 async function forcePoll(){
   const d=await api('GET','/api/state');
+  if(d&&d.entries){ _lastPollOk=Date.now(); _lastPollNetErr=false; } else { _lastPollNetErr=true; }
   if(!d||!d.entries) return;
   entries=d.entries;
   if(d.loggingEnabled!==undefined) _loggingEnabled=d.loggingEnabled;
@@ -216,6 +232,61 @@ function setStatus(m){
   s.textContent=m;s._tmp=true;clearTimeout(s._t);
   s._t=setTimeout(()=>{s._tmp=false;s.textContent='';updateFooterForActiveTab();},3500);
 }
+
+// ── Footer alert (bold/colored, used for the stale-connection watchdog) ──────
+// Shares the #ftr-status element with setStatus() — sets s._tmp so
+// updateFooterForActiveTab() won't clobber it while active, exactly like
+// setStatus() already does for regular short-lived status messages.
+function _footerAlert(msg,opts={}){
+  const s=document.getElementById('ftr-status');
+  clearTimeout(s._t);
+  s._tmp=true;
+  s.style.color=opts.color||'';
+  s.style.fontWeight=opts.bold?'700':'';
+  s.textContent=msg;
+  if(opts.autoClear!==false){
+    s._t=setTimeout(()=>{
+      s._tmp=false;s.style.color='';s.style.fontWeight='';s.textContent='';
+      updateFooterForActiveTab();
+    },opts.duration||3500);
+  }
+}
+
+// ── Stale connection watchdog ─────────────────────────────────────────────────
+// Called on tab visibility return and before Launch/Kill actions. Checks the
+// age of the last successful poll; if too old, alerts the user in the footer
+// and attempts an automatic soft-reconnect (forcePoll + reopen dead SSE).
+async function _checkStale(){
+  if(_staleActive) return;
+  if(Date.now()-_lastPollOk<STALE_MS) return;
+  _staleActive=true;
+  const msg=_lastPollNetErr
+    ?'⚠ SERVER NON RAGGIUNGIBILE — riconnessione…'
+    :'⚠ TAB SOSPESA DAL BROWSER — riconnessione…';
+  _footerAlert(msg,{color:'var(--red)',bold:true,autoClear:false});
+  await _attemptReconnect();
+}
+
+async function _attemptReconnect(){
+  await forcePoll();
+  const recovered=(Date.now()-_lastPollOk)<STALE_MS;
+  if(recovered){
+    // Reopen any panel SSE connection that is missing or actually closed
+    panels.forEach(uid=>{
+      if(!isWebapp(uid)&&!isFvPanel(uid)&&!isInfoPanel(uid)){
+        if(!sseConns[uid]||sseConns[uid].readyState===EventSource.CLOSED) connectSSE(uid);
+      }
+    });
+    if(activeTab&&!isWebapp(activeTab)&&(!sseConns[activeTab]||sseConns[activeTab].readyState===EventSource.CLOSED)){
+      connectSSE(activeTab);
+    }
+    _footerAlert('✓ RICONNESSO!',{color:'var(--grn)',bold:true,duration:3000});
+  } else {
+    _footerAlert('✕ RICONNESSIONE FALLITA — ricarica la pagina (F5)',{color:'var(--red)',bold:true,autoClear:false});
+  }
+  _staleActive=false;
+}
+
 function updateFooterForActiveTab(){
   const s=document.getElementById('ftr-status');
   if(!activeTab||!isWebapp(activeTab)){
@@ -787,6 +858,7 @@ async function pingUntilUp(url,maxMs=30000){
 
 // ── Actions ───────────────────────────────────────────────────────────────────
 async function doLaunch(uid){
+  _checkStale();
   const e=entries.find(x=>x.uid===uid);if(!e)return;
   await api('POST','/api/launch',{uid});
   if(!panels.includes(uid)){
@@ -808,6 +880,7 @@ async function doLaunch(uid){
 }
 
 async function doKill(uid){
+  _checkStale();
   const e=entries.find(x=>x.uid===uid);if(!e)return;
   const r=await api('POST','/api/kill',{uid});
   if(r.error){setStatus('Kill failed: '+r.error);return;}
