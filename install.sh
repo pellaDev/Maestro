@@ -66,6 +66,8 @@ INSTALL_DIR="${INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 BIN_DIR="${INSTALL_DIR}/bin"
 DATA_DIR="${INSTALL_DIR}/data"
 AUTOSTART_FILE="${HOME}/.config/autostart/maestro.desktop"
+APPS_DIR="${HOME}/.local/share/applications"   # XDG standard — not project-specific, resolved via $HOME
+APP_ENTRY_FILE="${APPS_DIR}/maestro.desktop"
 
 # ── Distro detection ──────────────────────────────────────────────────────────
 _DISTRO_ID=""
@@ -369,6 +371,33 @@ p.write_text(json.dumps(s, indent=2) + '\n')
   fi
 fi
 
+# ── Application menu entry ─────────────────────────────────────────────────────
+# Adds Maestro to the desktop's application launcher (GNOME Activities, KDE menu,
+# etc.) so it can be started like any other installed app — no terminal window,
+# tray + background process only (Terminal=false).
+hdr "Application menu entry"
+echo ""
+read -rp "  Create an application menu entry (so Maestro shows up like an installed app)? [Y/n] " APPENTRY
+APPENTRY="${APPENTRY:-Y}"
+if [[ "$APPENTRY" =~ ^[Yy]$ ]]; then
+  mkdir -p "${APPS_DIR}"
+  cat > "${APP_ENTRY_FILE}" << EOF
+[Desktop Entry]
+Type=Application
+Name=Maestro
+Comment=Privacy-first process orchestrator
+Exec=bash ${BIN_DIR}/start.sh
+Icon=${BIN_DIR}/img/MaestroLogo.svg
+Terminal=false
+Categories=Utility;Development;
+StartupNotify=false
+EOF
+  ok "Application menu entry created → ${APP_ENTRY_FILE}"
+  info "  Find it in your app launcher by searching 'Maestro'."
+else
+  info "Skipped. Launch manually via bin/start.sh"
+fi
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}  ✓ Maestro installed successfully!${RST}"
@@ -376,6 +405,7 @@ echo ""
 echo -e "  ${BOLD}Launch:${RST}"
 echo -e "    bash ${BIN_DIR}/start.sh"
 echo -e "    ${DIM}# or: python3 ${BIN_DIR}/start.py${RST}"
+echo -e "    ${DIM}# or from your application launcher, if the menu entry was created${RST}"
 echo ""
 echo -e "  ${BOLD}UI:${RST}"
 echo -e "    http://127.0.0.1:8865  (after launch)"

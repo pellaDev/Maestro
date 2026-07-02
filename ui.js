@@ -463,7 +463,7 @@ function renderSidebar(){
     const nm=el('div','ename');nm.textContent=e.displayName||(e.path||'').split('/').pop();nm.title=e.path||'';
     const right=el('div','eright');
     const met=el('div','emet');met.dataset.smet=e.uid;
-    if(e.pid){
+    if(e.pid&&!e.openOutside){
       const cpu=(e.metrics&&e.metrics.cpu)||0;
       const ram=(e.metrics&&e.metrics.ram)||0;
       met.innerHTML=_fmtStats(cpu,ram);
@@ -498,7 +498,7 @@ function patchMeta(){
     document.querySelectorAll(`[data-smet="${e.uid}"]`).forEach(m=>{
       const cpu=(e.metrics&&e.metrics.cpu)||0;
       const ram=(e.metrics&&e.metrics.ram)||0;
-      let html=e.pid?_fmtStats(cpu,ram):'';
+      let html=(e.pid&&!e.openOutside)?_fmtStats(cpu,ram):'';
       if(e.status==='ON') html+=`<span class="efav">★</span>`;
       m.innerHTML=html;
     });
@@ -666,11 +666,11 @@ function updatePanelMeta(){
   entries.forEach(e=>{
     document.querySelectorAll(`[data-pdot="${e.uid}"]`).forEach(d=>d.className='dot '+dotCls(e));
     document.querySelectorAll(`[data-pmet="${e.uid}"]`).forEach(m=>{
-      if(e.pid&&e.metrics) m.innerHTML=_fmtStats(e.metrics.cpu||0,e.metrics.ram||0); else m.innerHTML='';
+      if(e.pid&&e.metrics&&!e.openOutside) m.innerHTML=_fmtStats(e.metrics.cpu||0,e.metrics.ram||0); else m.innerHTML='';
     });
     document.querySelectorAll(`[data-smet="${e.uid}"]`).forEach(m=>{
       const cpu=(e.metrics&&e.metrics.cpu)||0,ram=(e.metrics&&e.metrics.ram)||0;
-      let html=e.pid?_fmtStats(cpu,ram):'';
+      let html=(e.pid&&!e.openOutside)?_fmtStats(cpu,ram):'';
       if(e.status==='ON') html+=`<span class="efav">★</span>`;
       m.innerHTML=html;
     });
@@ -699,7 +699,7 @@ function makeTermPanel(uid){
   const dot=el('div',isMaestro?'dot run':'dot '+dotCls(e||{}));dot.dataset.pdot=uid;
   const title=el('div','tp-title');title.textContent=name;title.title=e?.path||'';title.style.color=c.title;
   const met=el('div','tp-met');met.dataset.pmet=uid;
-  if(e?.pid&&e?.metrics) met.innerHTML=_fmtStats(e.metrics.cpu||0,e.metrics.ram||0);
+  if(e?.pid&&e?.metrics&&!e?.openOutside) met.innerHTML=_fmtStats(e.metrics.cpu||0,e.metrics.ram||0);
 
   hdr.append(dot,title,met,tpbtn('⌫','Clear log',()=>doClearLog(uid)));
   if(!isMaestro){

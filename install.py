@@ -15,11 +15,14 @@ What it does:
   3. Copies source files
   4. Creates default settings.json
   5. Optionally enables autostart via HKCU registry Run key (winreg stdlib)
-  6. Prints launch instructions
+  6. Optionally creates a native Start Menu shortcut (pure ctypes COM, no pywin32) —
+     launches via pythonw.exe so no console window ever flashes on startup
+  7. Prints launch instructions
 
 Zero pip dependencies — uses only Python stdlib.
 """
-import argparse, json, os, platform, shutil, subprocess, sys, tempfile
+import argparse, ctypes, json, os, platform, shutil, subprocess, sys, tempfile
+from ctypes import wintypes
 from pathlib import Path
 
 # ── Colours (Windows ANSI — enabled via os.system('') trick) ──────────────────
@@ -32,6 +35,91 @@ def fail(msg): print(f"  {RED}[✗]{RST} {msg}")
 def warn(msg): print(f"  {YLW}[!]{RST} {msg}")
 def info(msg): print(f"  {BLU}[i]{RST} {msg}")
 def hdr(msg):  print(f"\n{BOLD}{msg}{RST}")
+
+
+# ── Shortcut helper (pure ctypes COM, no pywin32) ──────────────────────────────
+def _create_shortcut_win(shortcut_path: str, target: str, arguments: str = '',
+                          working_dir: str = '', description: str = 'Maestro'):
+    """
+    Create a native Windows .lnk shortcut via raw ctypes COM calls
+    (IShellLinkW + IPersistFile). No pywin32 dependency — consistent with
+    tray.py's existing raw-ctypes Win32 backend (zero pip, stdlib only).
+
+    Vtable slot indices below come from the documented IUnknown/IShellLinkW/
+    IPersist/IPersistFile interface method orders (shobjidl_core.h, objidl.h).
+    """
+    from ctypes import (POINTER, Structure, byref, c_void_p, c_ulong,
+                         c_ushort, c_ubyte, c_long, sizeof, cast, WINFUNCTYPE)
+
+    HRESULT = c_long
+
+    class GUID(Structure):
+        _fields_ = [
+            ('Data1', c_ulong), ('Data2', c_ushort), ('Data3', c_ushort),
+            ('Data4', c_ubyte * 8),
+        ]
+
+    ole32 = ctypes.windll.ole32
+    ole32.CLSIDFromString.argtypes  = [wintypes.LPCWSTR, POINTER(GUID)]
+    ole32.CLSIDFromString.restype   = HRESULT
+    ole32.CoInitialize.argtypes     = [c_void_p]
+    ole32.CoInitialize.restype      = HRESULT
+    ole32.CoCreateInstance.argtypes = [POINTER(GUID), c_void_p, wintypes.DWORD,
+                                        POINTER(GUID), POINTER(c_void_p)]
+    ole32.CoCreateInstance.restype  = HRESULT
+
+    def _guid(s):
+        g = GUID()
+        ole32.CLSIDFromString(s, byref(g))
+        return g
+
+    def _com_call(iface_ptr, index, restype, argtypes, *args):
+        """Call a COM interface method by vtable slot index."""
+        vtbl = cast(iface_ptr, POINTER(c_void_p))[0]
+        slot = cast(vtbl + index * sizeof(c_void_p), POINTER(c_void_p))[0]
+        func = WINFUNCTYPE(restype, c_void_p, *argtypes)(slot)
+        return func(iface_ptr, *args)
+
+    CLSCTX_INPROC_SERVER = 0x1
+    CLSID_ShellLink  = _guid('{00021401-0000-0000-C000-000000000046}')
+    IID_IShellLinkW  = _guid('{000214F9-0000-0000-C000-000000000046}')
+    IID_IPersistFile = _guid('{0000010B-0000-0000-C000-000000000046}')
+
+    ole32.CoInitialize(None)
+
+    p_sl = c_void_p()
+    hr = ole32.CoCreateInstance(byref(CLSID_ShellLink), None, CLSCTX_INPROC_SERVER,
+                                 byref(IID_IShellLinkW), byref(p_sl))
+    if hr != 0 or not p_sl:
+        raise OSError(f'CoCreateInstance(IShellLinkW) failed: hr={hr:#x}')
+
+    # IShellLinkW vtable slots (0/1/2 = IUnknown QueryInterface/AddRef/Release):
+    #   7  = SetDescription
+    #   9  = SetWorkingDirectory
+    #   11 = SetArguments
+    #   20 = SetPath
+    _com_call(p_sl, 20, HRESULT, (wintypes.LPCWSTR,), target)
+    _com_call(p_sl, 11, HRESULT, (wintypes.LPCWSTR,), arguments)
+    _com_call(p_sl, 9,  HRESULT, (wintypes.LPCWSTR,), working_dir)
+    _com_call(p_sl, 7,  HRESULT, (wintypes.LPCWSTR,), description)
+
+    # QueryInterface (slot 0) for IPersistFile on the same object
+    p_pf = c_void_p()
+    hr = _com_call(p_sl, 0, HRESULT, (POINTER(GUID), POINTER(c_void_p)),
+                    byref(IID_IPersistFile), byref(p_pf))
+    if hr != 0 or not p_pf:
+        raise OSError(f'QueryInterface(IPersistFile) failed: hr={hr:#x}')
+
+    # IPersistFile vtable slot 6 = Save(LPCOLESTR pszFileName, BOOL fRemember)
+    hr = _com_call(p_pf, 6, HRESULT, (wintypes.LPCWSTR, wintypes.BOOL),
+                    shortcut_path, True)
+    if hr != 0:
+        raise OSError(f'IPersistFile::Save failed: hr={hr:#x}')
+
+    _com_call(p_pf, 2, c_ulong, ())   # Release IPersistFile
+    _com_call(p_sl, 2, c_ulong, ())   # Release IShellLinkW
+    ole32.CoUninitialize()
+
 
 # ── Args ───────────────────────────────────────────────────────────────────────
 SCRIPT_DIR          = Path(__file__).parent.resolve()
@@ -232,6 +320,42 @@ else:
     else:
         info("Autostart not enabled. Enable it later from the ⚙ Settings modal.")
 
+# ── Shortcut ──────────────────────────────────────────────────────────────────
+# Native Start Menu .lnk shortcut, so Maestro shows up like any installed app.
+# Targets pythonw.exe directly (bypassing start.bat) so no console window ever
+# flashes on launch — tray + background process only.
+hdr("Shortcut")
+print()
+create_shortcut = input(
+    "  Create a Start Menu shortcut (silent launch, no console window)? [Y/n] "
+).strip() or 'Y'
+if create_shortcut.lower() == 'y':
+    pythonw = Path(sys.executable).with_name('pythonw.exe')
+    start_py = BIN_DIR / 'start.py'
+    if pythonw.exists():
+        shortcut_target    = str(pythonw)
+        shortcut_arguments = f'"{start_py}"'
+    else:
+        warn(f"pythonw.exe not found next to {sys.executable}")
+        warn("  Falling back to start.bat — a console window may flash briefly on launch")
+        shortcut_target    = str(BIN_DIR / 'start.bat')
+        shortcut_arguments = ''
+    start_menu_dir = Path(os.environ.get('APPDATA', '')) / 'Microsoft' / 'Windows' / 'Start Menu' / 'Programs'
+    try:
+        start_menu_dir.mkdir(parents=True, exist_ok=True)
+        shortcut_path = start_menu_dir / 'Maestro.lnk'
+        _create_shortcut_win(
+            str(shortcut_path), shortcut_target, shortcut_arguments,
+            working_dir=str(BIN_DIR), description='Maestro — process orchestrator',
+        )
+        ok(f"Shortcut created → {shortcut_path}")
+        info("  Find it in the Start Menu by searching 'Maestro'.")
+    except Exception as ex:
+        warn(f"Could not create shortcut: {ex}")
+        warn(f"  You can still launch Maestro via {BIN_DIR}\\start.bat")
+else:
+    info(f"Skipped. Launch manually via {BIN_DIR}\\start.bat")
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 print()
 print(f"{BOLD}  ✓ Maestro installed successfully!{RST}")
@@ -239,13 +363,14 @@ print()
 print(f"  {BOLD}Launch:{RST}")
 print(f"    Double-click  {BIN_DIR}\\start.bat")
 print(f"    Or run:       python \"{BIN_DIR}\\start.py\"")
+print(f"    Or from the Start Menu, if the shortcut was created")
 print()
 print(f"  {BOLD}UI:{RST}")
 print(f"    http://127.0.0.1:8865  (after launch)")
 print()
 print(f"  {BOLD}Data directory:{RST}")
 print(f"    {DATA_DIR}")
-print(f"    {DIM}config.txt, logs\\, settings.json{RST}")
+print(f"    {DIM}config.txt, settings.json, logs\\{RST}")
 if not BASH_PATH:
     print()
     warn("Remember: install WSL or Git Bash to be able to run .sh scripts.")
