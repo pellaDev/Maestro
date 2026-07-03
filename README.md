@@ -19,7 +19,7 @@ Maestro lets you launch, monitor, and manage shell scripts from a browser UI run
 ---
 
 <p align="center">
-<img width="2187" height="1336" alt="Pasted image (2)" src="https://github.com/user-attachments/assets/2e512e68-db4b-416d-9d12-f9949bbc4742" />
+<img width="2313" height="1341" alt="screenshot" src="https://github.com/user-attachments/assets/c4dc7b4d-3bf8-4bbe-aff0-2870bd0f4c20" />
 </p>
 
 ## What is Maestro?
