@@ -1,0 +1,36 @@
+# Path: .github/workflows/release.yml
+#
+# Triggers on any pushed tag matching v* (e.g. v2.1, v2.2, v3.0) and creates
+# a GitHub Release for it automatically, with auto-generated release notes.
+#
+# This is the "Stable" channel for the future in-app "Update Maestro" feature:
+#   - UPDATE STABLE will pull the latest tagged Release created by this workflow
+#   - UPDATE LATEST will keep pulling the main branch zip directly (no Release involved)
+#
+# Tagging convention: vMAJOR.MINOR (matches the version badge in ui.html, e.g. "v2.1").
+#
+# To cut a new release:
+#   git tag vX.Y
+#   git push origin vX.Y
+#
+# No secrets to configure — uses the built-in GITHUB_TOKEN (contents: write below
+# grants it permission to create releases in this repo only).
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
