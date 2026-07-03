@@ -123,11 +123,32 @@ Git Bash:            https://git-scm.com/download/win
 
 ## Install
 
+Maestro has two install channels — pick one when cloning below:
+
+- **Latest** — tracks the `main` branch directly. This is the primary,
+  most up-to-date channel; most development and testing happens here.
+- **Stable** — pinned to the most recent tagged
+  [GitHub Release](https://github.com/AIdevelopmentPit/Maestro/releases), a
+  frozen snapshot for anyone who'd rather not track `main` day-to-day.
+
+Both channels use the exact same installer (`install.sh` / `install.py`) —
+the only difference is which commit you check out *before* running it.
+
 ### Linux — from GitHub
 
+**Latest (main branch):**
 ```bash
 git clone https://github.com/AIdevelopmentPit/Maestro.git
 cd Maestro
+bash install.sh
+```
+
+**Stable (latest tagged Release):**
+```bash
+git clone https://github.com/AIdevelopmentPit/Maestro.git
+cd Maestro
+git fetch --tags
+git checkout "$(git describe --tags "$(git rev-list --tags --max-count=1)")"
 bash install.sh
 ```
 
@@ -143,6 +164,7 @@ The installer will:
 2. Confirm the install path (default: the folder where `install.sh` lives)
 3. Create `bin/` and `data/` inside that folder
 4. Optionally enable autostart via `~/.config/autostart/maestro.desktop`
+5. Optionally create an application menu entry (GNOME Activities, KDE menu, etc.)
 
 Custom install path (optional — if you want bin/ and data/ somewhere else):
 ```bash
@@ -158,6 +180,8 @@ cp tray.py main.py daemon.py ui.html ui.js webui.js start.sh start.py /my/path/b
 cp img/MaestroLogo.svg img/MaestroLogo24x24.png /my/path/bin/img/
 chmod +x /my/path/bin/start.sh /my/path/bin/start.py /my/path/bin/tray.py
 ```
+A manual copy is inherently whatever version you copied from — there's no
+channel selection here, that only applies to the `git clone` paths above.
 
 ---
 
@@ -165,9 +189,19 @@ chmod +x /my/path/bin/start.sh /my/path/bin/start.py /my/path/bin/tray.py
 
 Open **PowerShell** or **Command Prompt**:
 
+**Latest (main branch):**
 ```powershell
 git clone https://github.com/AIdevelopmentPit/Maestro.git
 cd Maestro
+python install.py
+```
+
+**Stable (latest tagged Release):**
+```powershell
+git clone https://github.com/AIdevelopmentPit/Maestro.git
+cd Maestro
+git fetch --tags
+git checkout (git describe --tags (git rev-list --tags --max-count=1))
 python install.py
 ```
 
@@ -183,6 +217,7 @@ The installer will:
 3. Create `bin\` and `data\` inside that folder
 4. Create `data\settings.json` with defaults
 5. Optionally enable autostart via the Windows registry (`HKCU\...\Run`)
+6. Optionally create a Start Menu shortcut (silent launch, no console window)
 
 Custom install path (optional):
 ```powershell
@@ -293,12 +328,12 @@ Located in `data/settings.json`. Edited via the ⚙ Settings modal in the UI.
 │   ├── tray.py           ← tray daemon entry point (GTK / Win32 / headless)
 │   ├── main.py           ← HTTP server + UI layer
 │   ├── daemon.py         ← process manager, SSE broker, metrics (Linux + Windows)
-│   ├── ui.html           ← single-page frontend shell
-│   ├── ui.js             ← all frontend JS
-│   ├── webui.js          ← WebApp iframe lifecycle
-│   ├── start.sh          ← Linux launch script
-│   ├── start.py          ← cross-platform Python launch script
-│   ├── start.bat         ← Windows launch script (calls start.py)
+│   ├── ui.html            ← single-page frontend shell
+│   ├── ui.js              ← all frontend JS
+│   ├── webui.js           ← WebApp iframe lifecycle
+│   ├── start.sh           ← Linux launch script
+│   ├── start.py           ← cross-platform Python launch script
+│   ├── start.bat          ← Windows launch script (calls start.py)
 │   └── img/
 │       ├── MaestroLogo.svg
 │       └── MaestroLogo24x24.png
