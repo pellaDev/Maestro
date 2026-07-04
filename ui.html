@@ -287,7 +287,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--txt1);
 .finput:focus{border-color:var(--acc3)}
 .finfo{font-size:10px;color:var(--txt3);line-height:1.5;word-break:break-all}
 .trow{display:flex;align-items:center;gap:8px}
-.trow label{font-size:12px;color:var(--txt2);flex:1;cursor:default}
+.trow-label{font-size:12px;color:var(--txt2);flex:1;cursor:default}
 .tog{width:32px;height:18px;background:var(--brd);border-radius:9px;
   position:relative;cursor:pointer;transition:background .2s;flex-shrink:0}
 .tog.on{background:var(--acc1)}
@@ -329,15 +329,24 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--txt1);
 
 /* ── Footer ── */
 #ftr{grid-area:ftr;background:var(--bg3);border-top:1px solid var(--brd);display:flex;flex-direction:column}
-#ftr-inner{flex:1;display:flex;align-items:center;justify-content:center;
-  padding:0 14px;position:relative;overflow:hidden}
+/* #ftr-status used to be position:absolute with no explicit `top`, relying on each
+   browser's "static position" algorithm for an absolutely-positioned flex child —
+   inconsistent across browsers, and in practice it could render outside #ftr-inner's
+   box entirely (the "watchdog message ends up above the footer" bug). It is now a
+   normal in-flow flex sibling of #ftr-center instead, so it is structurally
+   impossible for it to render outside the footer bar, regardless of message length
+   or browser quirks. */
+#ftr-inner{flex:1;display:flex;align-items:center;gap:10px;
+  padding:0 14px;overflow:hidden}
+#ftr-center{flex:1;min-width:0;overflow:hidden}
 #ftr-quote{font-size:11px;color:var(--txt3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:center}
 #ftr-url{display:none;font-size:11px;color:var(--txt2);text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #ftr-url.show{display:block}
 #ftr-tip{display:none;font-size:11px;color:var(--txt2);text-align:center}
 #ftr-tip.show{display:block}
 #ftr-quote.hide{display:none}
-#ftr-status{position:absolute;right:14px;font-size:11px;color:var(--grn);white-space:nowrap}
+#ftr-status{flex-shrink:0;max-width:50%;font-size:11px;color:var(--grn);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #loadbar{height:2px;background:var(--brd);overflow:hidden}
 #loadfill{height:100%;background:var(--acc1);width:0}
 #loadfill.act{animation:ldani 1.1s ease-in-out infinite}
@@ -378,7 +387,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--txt1);
     <div id="lsb-resizer"></div>
     <div id="lsb-logo">
       <img src="/img/MaestroLogo.svg" class="logo-img" onerror="this.style.display='none'">
-      <span class="logo">MAESTRO</span><span class="ver">v2.1</span>
+      <span class="logo">MAESTRO</span><span class="ver">v2.1.1</span>
       <button class="action-btn" id="btn-terms" data-tip="Show terminal panels grid">TERMINALS</button>
     </div>
     <div id="lsb-tools">
@@ -411,9 +420,11 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--txt1);
 
   <footer id="ftr">
     <div id="ftr-inner">
-      <div id="ftr-quote"><em>"Essendo che la vita è parto e che porto non tengo non potei che viaggiare pirata"</em>&nbsp;Una Nave.</div>
-      <div id="ftr-url"></div>
-      <div id="ftr-tip"></div>
+      <div id="ftr-center">
+        <div id="ftr-quote"><em>"Essendo che la vita è parto e che porto non tengo non potei che viaggiare pirata"</em>&nbsp;Una Nave.</div>
+        <div id="ftr-url"></div>
+        <div id="ftr-tip"></div>
+      </div>
       <span id="ftr-status"></span>
     </div>
     <div id="loadbar"><div id="loadfill"></div></div>

@@ -30,10 +30,26 @@ const _tabReady=new Set();
 // non-focused tab. This silently stalls poll() and can drop SSE connections,
 // making the UI look "frozen" (clicks on Launch/Kill appear to do nothing) until
 // the page is manually refreshed. This watchdog detects the stall and recovers.
-const STALE_MS = 6000;           // ms without a successful poll before we consider the UI stale
+//
+// Recovery is PERSISTENT, not "try 3 times and give up": real-world testing
+// showed a single reload right after wake often still fails (the browser's
+// network stack itself needs a beat to fully recover), and the working manual
+// workaround was "refresh / stop / refresh a few times" — i.e. keep retrying.
+// So the watchdog does a short fast-retry burst, then falls back to a slow
+// indefinite retry (every SLOW_RETRY_MS) for as long as the tab stays visible,
+// with a clickable footer message for an immediate manual retry at any point.
+const STALE_MS       = 6000;   // ms without a successful poll before we consider the UI stale
+const API_TIMEOUT_MS = 6000;   // hard ceiling for every api() fetch, via AbortSignal.timeout —
+                                // without this a fetch riding a half-dead post-resume connection
+                                // could hang far longer than STALE_MS and never let the watchdog
+                                // even start retrying.
+const FAST_TRIES     = 4;      // quick attempts right after staleness is detected
+const FAST_GAP_MS    = 1500;   // gap between fast attempts
+const SLOW_RETRY_MS  = 15000;  // gap between attempts once in the persistent slow phase
 let _lastPollOk = Date.now();    // timestamp of the last successful /api/state response
 let _lastPollNetErr = false;     // true = last poll failed with a real fetch error; false = just stale (throttled timer)
 let _staleActive = false;        // guards against overlapping reconnect attempts
+let _reconnectTimer = null;      // setTimeout id for the current pending reconnect attempt
 
 let _widePanels={};
 try{ _widePanels=JSON.parse(localStorage.getItem('tpw')||'{}'); }catch{}
@@ -49,7 +65,7 @@ _loadPanels();
 
 document.addEventListener('visibilitychange',()=>{
   _pageVisible=!document.hidden;
-  if(_pageVisible){ poll(); _checkStale(); }
+  if(_pageVisible){ _forceReconnectAllSSE(); poll(); _checkStale(); }
 });
 
 // DOM refs needed by poll callbacks — must be initialized before any async poll result
@@ -79,7 +95,10 @@ setInterval(()=>{ if(_loadN>0){_loadN=0;_loadFill.classList.remove('act');} },80
 async function api(method,path,body){
   showLoad();
   try{
-    const o={method,headers:{'Content-Type':'application/json'}};
+    // signal: AbortSignal.timeout(...) guarantees this promise always settles within
+    // API_TIMEOUT_MS, even if the underlying connection is stalled — see the watchdog
+    // state comment above for why this matters after a browser tab suspend/resume.
+    const o={method,headers:{'Content-Type':'application/json'},signal:AbortSignal.timeout(API_TIMEOUT_MS)};
     if(body!==undefined) o.body=JSON.stringify(body);
     return await (await fetch(path,o)).json();
   }catch(e){ return{error:String(e)}; }
@@ -237,53 +256,121 @@ function setStatus(m){
 // Shares the #ftr-status element with setStatus() — sets s._tmp so
 // updateFooterForActiveTab() won't clobber it while active, exactly like
 // setStatus() already does for regular short-lived status messages.
+// opts.clickable makes the message itself act as a manual "retry now" button.
 function _footerAlert(msg,opts={}){
   const s=document.getElementById('ftr-status');
   clearTimeout(s._t);
   s._tmp=true;
   s.style.color=opts.color||'';
   s.style.fontWeight=opts.bold?'700':'';
+  s.style.cursor=opts.clickable?'pointer':'';
+  s.title=opts.clickable?'Click to retry now':'';
+  s.onclick=opts.clickable?()=>{
+    clearTimeout(_reconnectTimer);
+    _reconnectCycle(FAST_TRIES); // skip straight to another attempt, bypassing the wait
+  }:null;
   s.textContent=msg;
   if(opts.autoClear!==false){
     s._t=setTimeout(()=>{
-      s._tmp=false;s.style.color='';s.style.fontWeight='';s.textContent='';
+      s._tmp=false;s.style.color='';s.style.fontWeight='';s.style.cursor='';s.title='';s.onclick=null;s.textContent='';
       updateFooterForActiveTab();
     },opts.duration||3500);
   }
 }
 
+// ── Force-reconnect all SSE connections ───────────────────────────────────────
+// EventSource.readyState is NOT trustworthy after a browser tab suspend/resume:
+// Chrome can keep reporting OPEN for a socket that is actually dead, especially
+// on loopback connections where there's no network-level signal (no RST, no
+// link-down event) to make the browser realize the connection is gone. A
+// "zombie" open EventSource still counts against Chrome's per-origin HTTP/1.1
+// connection limit (6 concurrent). With a few panels open, dead zombie sockets
+// can permanently saturate that pool — every other request (a fresh fetch, or
+// a new EventSource) then queues forever waiting for a free slot, visible in
+// DevTools as "Provisional headers are shown" on a request that never even
+// gets dispatched to the network. THIS was the actual root cause of the
+// watchdog looking permanently stuck: its own reconnect attempts were queuing
+// behind dead SSE sockets that never got closed, no matter how many times it
+// retried. The only reliable fix is to stop trusting readyState and
+// unconditionally close + reopen every SSE connection on wake, which forces
+// Chrome to release those slots immediately.
+function _forceReconnectAllSSE(){
+  Object.keys(sseConns).forEach(uid=>{
+    try{ sseConns[uid].close(); }catch{}
+  });
+  sseConns={};
+  panels.forEach(uid=>{
+    if(!isWebapp(uid)&&!isFvPanel(uid)&&!isInfoPanel(uid)) connectSSE(uid);
+  });
+  if(activeTab&&!isWebapp(activeTab)) connectSSE(activeTab);
+}
+
 // ── Stale connection watchdog ─────────────────────────────────────────────────
 // Called on tab visibility return and before Launch/Kill actions. Checks the
 // age of the last successful poll; if too old, alerts the user in the footer
-// and attempts an automatic soft-reconnect (forcePoll + reopen dead SSE).
+// and starts a persistent reconnect cycle (see _reconnectCycle below).
 async function _checkStale(){
   if(_staleActive) return;
   if(Date.now()-_lastPollOk<STALE_MS) return;
   _staleActive=true;
+  _forceReconnectAllSSE();
   const msg=_lastPollNetErr
     ?'⚠ SERVER NON RAGGIUNGIBILE — riconnessione…'
     :'⚠ TAB SOSPESA DAL BROWSER — riconnessione…';
   _footerAlert(msg,{color:'var(--red)',bold:true,autoClear:false});
-  await _attemptReconnect();
+  await _reconnectCycle(0);
 }
 
-async function _attemptReconnect(){
+// One step of the reconnect cycle. `attempt` is 0-based during the fast phase;
+// once attempt >= FAST_TRIES we're in the slow, indefinite phase.
+//
+// Fast phase (attempt 0..FAST_TRIES-1): quick attempts FAST_GAP_MS apart — the
+// first fetch right after a browser un-suspends a tab often still rides a
+// half-dead connection, a couple of quick retries usually clears that.
+//
+// Slow phase (attempt >= FAST_TRIES): retries every SLOW_RETRY_MS indefinitely.
+// This is deliberately NOT capped — real-world testing showed the manual
+// "refresh / stop / refresh a few times" workaround needed more than 3 tries
+// over 20s to succeed, so the watchdog now keeps trying for as long as it
+// takes, with a clickable footer message for an immediate manual retry.
+//
+// The loop pauses (does not give up) if the tab goes back to background —
+// _staleActive is released so a fresh _checkStale() naturally restarts it
+// when the tab becomes visible again, rather than silently spinning forever
+// on a tab nobody is looking at.
+async function _reconnectCycle(attempt){
+  if(!_pageVisible){ _staleActive=false; return; }
   await forcePoll();
   const recovered=(Date.now()-_lastPollOk)<STALE_MS;
-  if(recovered){
-    // Reopen any panel SSE connection that is missing or actually closed
-    panels.forEach(uid=>{
-      if(!isWebapp(uid)&&!isFvPanel(uid)&&!isInfoPanel(uid)){
-        if(!sseConns[uid]||sseConns[uid].readyState===EventSource.CLOSED) connectSSE(uid);
-      }
-    });
-    if(activeTab&&!isWebapp(activeTab)&&(!sseConns[activeTab]||sseConns[activeTab].readyState===EventSource.CLOSED)){
-      connectSSE(activeTab);
-    }
-    _footerAlert('✓ RICONNESSO!',{color:'var(--grn)',bold:true,duration:3000});
-  } else {
-    _footerAlert('✕ RICONNESSIONE FALLITA — ricarica la pagina (F5)',{color:'var(--red)',bold:true,autoClear:false});
+  if(recovered){ _onReconnected(); return; }
+
+  if(attempt<FAST_TRIES-1){
+    _reconnectTimer=setTimeout(()=>_reconnectCycle(attempt+1),FAST_GAP_MS);
+    return;
   }
+  _footerAlert('✕ Riconnessione in corso… clic per riprovare subito',
+    {color:'var(--red)',bold:true,autoClear:false,clickable:true});
+  _reconnectTimer=setTimeout(()=>_reconnectCycle(attempt+1),SLOW_RETRY_MS);
+}
+
+function _onReconnected(){
+  clearTimeout(_reconnectTimer);_reconnectTimer=null;
+  // SSE connections were already unconditionally force-closed and reopened by
+  // _forceReconnectAllSSE() when this stale episode started (see _checkStale)
+  // — nothing more to do for them here, and readyState isn't trustworthy
+  // enough to base any further decision on.
+  // Webapp iframes (Jellyfin, Tunarr, ComfyUI, ...) don't use SSE and can't
+  // self-heal from Maestro's side — they're a different origin running their
+  // own JS. A stale/dead connection inside one of them just sits there broken
+  // until something forces a fresh load. Force-reload every webapp tab whose
+  // process is still running, exactly what manually hitting reload on each of
+  // them accomplishes, just automatic.
+  _tabReady.forEach(uid=>{
+    const m=uid.match(/^(.+)_w(\d+)$/);if(!m)return;
+    const e=entries.find(x=>x.uid===m[1]);
+    if(e&&e.pid) reloadWebTab(uid);
+  });
+  _footerAlert('✓ RICONNESSO!',{color:'var(--grn)',bold:true,duration:3000});
   _staleActive=false;
 }
 
@@ -860,7 +947,8 @@ async function pingUntilUp(url,maxMs=30000){
 async function doLaunch(uid){
   _checkStale();
   const e=entries.find(x=>x.uid===uid);if(!e)return;
-  await api('POST','/api/launch',{uid});
+  const r=await api('POST','/api/launch',{uid});
+  if(r&&r.error){setStatus('Launch failed: '+r.error);return;}
   if(!panels.includes(uid)){
     panels.push(uid);
     if(!e.launchHidden){
@@ -902,7 +990,8 @@ async function doRemove(uid){
   (e.webapps||[]).forEach((_,wi)=>_tabReady.delete(`${uid}_w${wi}`));
   hidePanel(uid);hidePanel('fv_'+uid);hidePanel('info_'+uid);
   if(activeTab===uid||(e.webapps||[]).some((_,wi)=>activeTab===`${uid}_w${wi}`)) closePill();
-  await api('POST','/api/remove',{idx});
+  const r=await api('POST','/api/remove',{idx});
+  if(r&&r.error){setStatus('Remove failed: '+r.error);return;}
   if(selIdx===idx)selIdx=-1;else if(selIdx>idx)selIdx--;
   closeEdit();await poll();
 }
@@ -1058,9 +1147,15 @@ function _smSection(title){
   const t=el('div','sm-section-title');t.textContent=title;
   w.appendChild(t);return w;
 }
+// Toggle rows use a <span> for the label, not <label>, because the actual
+// control is a custom <div class="tog"> — not a real labelable form element
+// (input/select/textarea/button). A <label for="..."> pointing at a <div>
+// is invalid HTML and shows up as a Chrome DevTools "Issues" accessibility
+// warning ("No label associated with a form field"). A <span> makes the
+// same visual result without the false association.
 function _smToggle(label,key,checked,onChange){
   const row=el('div','trow');
-  const l=el('label','');l.textContent=label;
+  const l=el('span','trow-label');l.textContent=label;
   const t=el('div','tog'+(checked?' on':''));t.dataset.on=String(checked);
   t.onclick=()=>{const v=t.dataset.on!=='true';t.dataset.on=String(v);t.classList.toggle('on',v);onChange(v);};
   row.append(l,t);return row;
@@ -1069,6 +1164,10 @@ function _smInput(label,type,value){
   const w=el('div','field');
   const l=el('label','');l.textContent=label;
   const i=el('input','finput');i.type=type;i.value=value;
+  // Real <input> here, so give it an id and associate the label properly —
+  // this is what was missing and triggering the accessibility warning.
+  i.id='sm-inp-'+label.toLowerCase().replace(/[^a-z0-9]+/g,'-');
+  l.htmlFor=i.id;
   if(type==='number'){i.min='1';i.max='65535';}
   w.append(l,i);return i;  // return input directly for access
 }
@@ -1250,11 +1349,15 @@ function openEdit(idx){
       rbtn('Save',g(async()=>{
         const lbl=document.getElementById('r-sep-lbl').value.trim();
         const sf=document.getElementById('r-sep-sf').value.trim();
-        if(lbl){await api('POST','/api/update-entry',{idx,label:lbl,sepFile:sf});await poll();}
+        if(!lbl)return;
+        const r=await api('POST','/api/update-entry',{idx,label:lbl,sepFile:sf});
+        if(r&&r.error){setStatus('Save failed: '+r.error);return;}
+        await poll();setStatus('Saved.');
       })),hr(),
       rbtn('✕ Remove',g(async()=>{
         if(!confirm('Remove?'))return;
-        await api('POST','/api/remove',{idx});
+        const r=await api('POST','/api/remove',{idx});
+        if(r&&r.error){setStatus('Remove failed: '+r.error);return;}
         if(selIdx===idx)selIdx=-1;else if(selIdx>idx)selIdx--;
         closeEdit();await poll();
       }),false,'dng'));return;
@@ -1287,9 +1390,10 @@ function openEdit(idx){
       const us=document.getElementById('r-upd').value.trim();
       const inf=document.getElementById('r-info').value.trim();
       const webapps=collectWbEntries(wbList);
-      await api('POST','/api/update-entry',{idx,name,delay,autoRestart:ar,keepOpen:ko,
+      const r=await api('POST','/api/update-entry',{idx,name,delay,autoRestart:ar,keepOpen:ko,
         launchHidden:lh,openOutside:oo,termColor:_pc,webapps,updateScript:us,infoFile:inf,status:fav?'ON':'OFF'});
-      await poll();
+      if(r&&r.error){setStatus('Save failed: '+r.error);return;}
+      await poll();setStatus('Saved.');
     })),
     rbtn('▲ Move Up',async()=>doMove(idx,-1),true),
     rbtn('▼ Move Down',async()=>doMove(idx,1),true),
@@ -1302,7 +1406,7 @@ function closeEdit(){ document.getElementById('rsb').classList.remove('open');do
 function rfield(lbl,type,id,val){ const w=el('div','field');const l=el('label','');l.textContent=lbl;l.htmlFor=id;const i=el('input','finput');i.type=type;i.id=id;i.value=val;w.append(l,i);return w; }
 function rinfo(txt){ const d=el('div','finfo');d.textContent=txt;return d; }
 function rtog(lbl,id,checked){
-  const w=el('div','trow');const l=el('label','');l.textContent=lbl;
+  const w=el('div','trow');const l=el('span','trow-label');l.textContent=lbl;
   const t=el('div','tog'+(checked?' on':''));t.id=id;t.dataset.on=String(checked);
   t.onclick=()=>{const v=t.dataset.on!=='true';t.dataset.on=String(v);t.classList.toggle('on',v);};
   w.append(l,t);return w;
