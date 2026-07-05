@@ -1055,6 +1055,63 @@ function doAddSep(){
   api('POST','/api/add-sep',{name:name.trim()||'Separator',after:selIdx>=0?selIdx:entries.length-1}).then(()=>poll());
 }
 
+// ── Update Maestro (Settings modal) ───────────────────────────────────────────
+// Applies a full Maestro update from GitHub — either the "stable" channel
+// (latest tagged Release) or "latest" (main branch HEAD). See main.py's
+// /api/update-maestro and tray.py's _perform_update()/_reexec_self() for the
+// server-side download/stage/swap/restart sequence. This stops ALL running
+// managed scripts (full-stack restart, by design — see MAESTRO_GUIDE.md).
+async function doUpdateMaestro(channel){
+  const label=channel==='stable'?'Stable (latest tagged release)':'Latest (main branch)';
+  if(!confirm(
+    `Update Maestro to ${label}?\n\n`+
+    `This will stop ALL running scripts and restart Maestro. `+
+    `No automatic backup is kept.`
+  )) return;
+  setStatus(`Downloading ${channel} update…`);
+  const r=await api('POST','/api/update-maestro',{channel});
+  if(r&&r.ok){
+    Object.values(sseConns).forEach(es=>es.close());sseConns={};sessionStorage.clear();
+    document.body.innerHTML=
+      '<div style="display:flex;align-items:center;justify-content:center;height:100vh;'+
+      'color:#6b5040;font-family:monospace;text-align:center;line-height:2">'+
+      'Updating Maestro…<br><small style="font-size:12px">'+
+      'Restarting to apply the update — reload this page in a few seconds.</small></div>';
+  } else {
+    setStatus('Update failed: '+((r&&r.error)||'?'));
+  }
+}
+
+// Lightweight, client-side-only "is a newer Stable release available?" check.
+// Runs when the Settings modal opens — hits the GitHub API directly from the
+// browser (no backend involvement), so it costs nothing on the poll loop and
+// needs no server-side version tracking. Only the Stable channel is checked:
+// Latest always tracks main directly, so there's no meaningful "behind/ahead"
+// state to detect there without extra infra this feature doesn't need yet.
+async function _checkUpdateAvailable(){
+  const box=document.getElementById('sm-update-status');if(!box)return;
+  box.textContent='Checking for updates…';
+  try{
+    const res=await fetch(
+      'https://api.github.com/repos/AIdevelopmentPit/Maestro/releases/latest',
+      {signal:AbortSignal.timeout(6000)}
+    );
+    if(!res.ok) throw new Error('GitHub API error '+res.status);
+    const data=await res.json();
+    const latestTag=(data.tag_name||'').replace(/^v/,'');
+    const curVer=(document.querySelector('.ver')?.textContent||'').replace(/^v/,'');
+    if(latestTag&&curVer&&latestTag!==curVer){
+      box.innerHTML=`⚠ Stable release <b>v${latestTag}</b> is available (you're on v${curVer})`;
+    }else if(latestTag){
+      box.textContent=`✓ You're on the latest Stable tag (v${curVer})`;
+    }else{
+      box.textContent='';
+    }
+  }catch(ex){
+    box.textContent='Could not check for updates (offline or rate-limited).';
+  }
+}
+
 // ── Settings ──────────────────────────────────────────────────────────────────
 async function _fetchSettings(){
   const d=await api('GET','/api/settings');
@@ -1118,6 +1175,21 @@ function openSettings(){
     };
     secSrv.append(hostInp,portInp,warnDiv,saveSrvBtn);
     body.appendChild(secSrv);
+
+    // ── Update Maestro section ─────────────────────────────────────────────────
+    const secUpd=_smSection('Update Maestro');
+    const updStatus=el('div','finfo');updStatus.id='sm-update-status';updStatus.textContent='';
+    const updWarn=el('div','sm-warn');
+    updWarn.textContent='⚠ Stops ALL running scripts and restarts Maestro. No automatic backup is kept.';
+    const updRow=el('div','sm-links-row');
+    const btnStable=el('button','sm-btn');btnStable.textContent='⬆ Update Stable';
+    btnStable.onclick=()=>doUpdateMaestro('stable');
+    const btnLatest=el('button','sm-btn');btnLatest.textContent='⬆ Update Latest';
+    btnLatest.onclick=()=>doUpdateMaestro('latest');
+    updRow.append(btnStable,btnLatest);
+    secUpd.append(updStatus,updWarn,updRow);
+    body.appendChild(secUpd);
+    _checkUpdateAvailable();   // fire-and-forget, client-side only (see function docstring)
 
     // ── Links section ──────────────────────────────────────────────────────────
     const secLinks=_smSection('Links');

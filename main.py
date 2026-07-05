@@ -14,7 +14,8 @@ Responsibilities:
 Process management, SSE, config I/O → daemon.py
 """
 import http.server, json, os, queue, shutil, signal
-import subprocess, sys, tempfile, threading, time
+import subprocess, sys, tempfile, threading, time, zipfile
+import urllib.request
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -42,6 +43,109 @@ _TEXT_EXTS = {
     '.conf', '.ini', '.js', '.ts', '.html', '.css', '.xml', '.log', '.env',
     '.c', '.cpp', '.h', '.rs', '.go', '.rb', '.php', '.java', '.kt', '',
 }
+
+# ── Update Maestro (Settings modal "Update Stable" / "Update Latest") ─────────
+# See MAESTRO_GUIDE.md → "Update Maestro" feature section for the full design
+# rationale. Summary: main.py only downloads + validates + stages the new
+# files into a clean temp directory — it never touches bin/ itself. The
+# actual bin/ swap and full-stack restart (including tray.py re-exec, since
+# tray.py's own file may have changed) is handled by tray.py, triggered via
+# a marker file in DATA_DIR that tray.py checks after main.py exits.
+_GITHUB_REPO           = "AIdevelopmentPit/Maestro"
+_GITHUB_LATEST_ZIP_URL = f"https://github.com/{_GITHUB_REPO}/archive/refs/heads/main.zip"
+_GITHUB_RELEASES_API   = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
+_UPDATE_MARKER_NAME    = "update_request.json"
+
+# Runtime files copied from the downloaded zip into the clean staging dir —
+# intentionally mirrors install.sh / install.py's SRC_FILES so an update
+# never pulls repo-only files (README.md, install.sh, .github/, etc.) into
+# a live bin/.
+_UPDATE_SRC_FILES = [
+    "tray.py", "main.py", "daemon.py",
+    "ui.html", "ui.js", "webui.js",
+    "start.sh", "start.py", "start.bat",
+]
+_UPDATE_SRC_IMG_FILES = [
+    "img/MaestroLogo.svg",
+    "img/MaestroLogo24x24.png",
+]
+
+
+def _resolve_update_zip_url(channel: str) -> str:
+    """Resolve the source zip download URL for the given update channel."""
+    if channel == "latest":
+        return _GITHUB_LATEST_ZIP_URL
+    # stable: ask the GitHub API for the latest tagged Release's zipball.
+    # User-Agent is required by GitHub's API or the request is rejected.
+    req = urllib.request.Request(
+        _GITHUB_RELEASES_API,
+        headers={"User-Agent": "Maestro-Updater", "Accept": "application/vnd.github+json"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    url = data.get("zipball_url", "")
+    if not url:
+        raise RuntimeError("GitHub API did not return a zipball_url for the latest release")
+    return url
+
+
+def _stage_update(channel: str) -> Path:
+    """
+    Download the requested channel's source zip, extract it, validate it
+    contains the expected core files, and copy the known runtime file set
+    into a clean staging directory.
+
+    Never touches BASE_DIR/bin — safe to call before deciding to restart.
+    Returns the staging directory path on success.
+    Raises RuntimeError (or lets the underlying exception propagate) with a
+    human-readable message on any failure; the staging dir is cleaned up
+    before raising so no partial state is left behind.
+    """
+    url = _resolve_update_zip_url(channel)
+
+    tmp_zip_fd, tmp_zip_path = tempfile.mkstemp(suffix=".zip")
+    os.close(tmp_zip_fd)
+    extract_dir = Path(tempfile.mkdtemp(prefix="maestro_update_extract_"))
+    staging_dir = Path(tempfile.mkdtemp(prefix="maestro_update_stage_"))
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Maestro-Updater"})
+        with urllib.request.urlopen(req, timeout=60) as resp, open(tmp_zip_path, "wb") as f:
+            shutil.copyfileobj(resp, f)
+
+        with zipfile.ZipFile(tmp_zip_path) as zf:
+            zf.extractall(extract_dir)
+
+        # GitHub zips contain exactly one top-level folder (repo-branch or repo-sha)
+        subdirs = [p for p in extract_dir.iterdir() if p.is_dir()]
+        if len(subdirs) != 1:
+            raise RuntimeError(f"Unexpected zip layout ({len(subdirs)} top-level folders)")
+        repo_root = subdirs[0]
+
+        # Validate the core files exist before trusting this download at all
+        required = ["tray.py", "main.py", "daemon.py", "ui.html", "ui.js", "webui.js"]
+        missing = [f for f in required if not (repo_root / f).is_file()]
+        if missing:
+            raise RuntimeError(f"Downloaded archive is missing: {', '.join(missing)}")
+
+        # Copy only the known runtime file set into the clean staging dir
+        (staging_dir / "img").mkdir(parents=True, exist_ok=True)
+        for fname in _UPDATE_SRC_FILES:
+            src = repo_root / fname
+            if src.is_file():
+                shutil.copy2(src, staging_dir / fname)
+        for fpath in _UPDATE_SRC_IMG_FILES:
+            src = repo_root / fpath
+            if src.is_file():
+                shutil.copy2(src, staging_dir / fpath)
+        return staging_dir
+    except Exception:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+    finally:
+        try: os.unlink(tmp_zip_path)
+        except Exception: pass
+        shutil.rmtree(extract_dir, ignore_errors=True)
 
 # ── Settings ───────────────────────────────────────────────────────────────────
 _DEFAULT_SETTINGS: dict = {
@@ -205,6 +309,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/toggle-logging": self._toggle_logging,
             "/api/settings":       self._post_settings,
             "/api/shutdown":       self._shutdown,
+            "/api/update-maestro": self._update_maestro,
         }.get(route)
         if fn:
             fn(body)
@@ -650,6 +755,67 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         def _do():
             time.sleep(0.2)
+            daemon.kill_all()
+            daemon._stop.set()
+            with daemon._lock:
+                for e in daemon.entries:
+                    daemon._close_subs(e)
+            with daemon._self_subs_lock:
+                for q in daemon._self_subs:
+                    try: q.put_nowait(None)
+                    except: pass
+            if _server:
+                threading.Thread(target=_server.shutdown, daemon=True).start()
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _update_maestro(self, b: dict):
+        """
+        Download + stage a Maestro update from the requested channel
+        ("stable" = latest tagged Release, "latest" = main branch HEAD).
+
+        Responds only AFTER the download + extraction + validation have
+        all succeeded — a failure (bad network, GitHub rate limit,
+        malformed archive) is reported directly to the caller with an
+        error message, instead of triggering a restart that could never
+        recover. Only on success is the marker file written and the
+        graceful full-stack shutdown triggered; tray.py picks up the
+        marker after main.py exits and performs the actual bin/ swap +
+        restart (see tray.py's _check_and_apply_update / _perform_update).
+
+        bin/ itself is never touched by this handler — only DATA_DIR
+        (the marker file) and temp directories are written here.
+        """
+        channel = str(b.get("channel", "")).strip()
+        if channel not in ("stable", "latest"):
+            self._err(400, "channel must be 'stable' or 'latest'")
+            return
+
+        try:
+            staging_dir = _stage_update(channel)
+        except Exception as ex:
+            daemon._mlog(f"✕ Update staging failed ({channel}): {ex}")
+            self._json({"ok": False, "error": str(ex)})
+            return
+
+        marker = {
+            "channel":     channel,
+            "stagingDir":  str(staging_dir),
+            "requestedAt": time.time(),
+        }
+        try:
+            (_DATA_DIR / _UPDATE_MARKER_NAME).write_text(json.dumps(marker, indent=2))
+        except Exception as ex:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            daemon._mlog(f"✕ Could not write update marker: {ex}")
+            self._json({"ok": False, "error": f"Could not write update marker: {ex}"})
+            return
+
+        daemon._mlog(f"✓ Update staged ({channel}) — restarting to apply…")
+        self._json({"ok": True, "message": "Update staged — Maestro is restarting to apply it."})
+
+        def _do():
+            time.sleep(0.3)
             daemon.kill_all()
             daemon._stop.set()
             with daemon._lock:

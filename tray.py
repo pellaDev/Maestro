@@ -258,6 +258,12 @@ START_SH          = BIN_DIR / "start.sh"
 START_PY          = BIN_DIR / "start.py"
 AUTOSTART_DESKTOP = Path.home() / ".config" / "autostart" / "maestro.desktop"
 
+# Marker file written by main.py's POST /api/update-maestro handler once a
+# channel's source zip has been downloaded, validated, and staged into a
+# clean temp directory. Checked by _watch_main() after main.py exits —
+# see _check_and_apply_update() / _perform_update() below.
+UPDATE_MARKER = DATA_DIR / "update_request.json"
+
 # Temp dir for Cairo-generated Linux PNG tray icons
 _ICON_TMPDIR = Path(tempfile.mkdtemp(prefix="maestro_tray_"))
 
@@ -856,10 +862,107 @@ class MaestroTray:
         proc.wait()
         if self._intentional_stop:
             return
+        # An "Update Maestro" request (see main.py's /api/update-maestro)
+        # makes main.py exit voluntarily via the same graceful shutdown path
+        # as a normal /api/shutdown — this is NOT tray-initiated, so
+        # self._intentional_stop is still False here. Check for a pending
+        # update marker BEFORE falling through to crash handling, or every
+        # update would be misreported as "Stopped unexpectedly".
+        if self._check_and_apply_update():
+            return
         rc = proc.returncode
         self._update_icon(self.STATE_DOWN)
         _notify("Maestro",
                 f"Stopped unexpectedly (exit {rc}). Use the tray menu to restart.")
+
+    # ── Update Maestro (bin/ swap + full-stack restart) ────────────────────────
+    def _check_and_apply_update(self) -> bool:
+        """
+        Check for a pending update request written by main.py's
+        POST /api/update-maestro handler. If present, apply it and return
+        True so _watch_main() treats this exit as an intentional update
+        restart rather than a crash. Returns False if no update is pending.
+        """
+        if not UPDATE_MARKER.exists():
+            return False
+        try:
+            marker = json.loads(UPDATE_MARKER.read_text())
+        except Exception as ex:
+            print(f"[tray] ✕ Could not read update marker: {ex}", file=sys.stderr)
+            try: UPDATE_MARKER.unlink(missing_ok=True)
+            except Exception: pass
+            return False
+        try: UPDATE_MARKER.unlink(missing_ok=True)
+        except Exception: pass
+        self._perform_update(marker.get("stagingDir", ""), marker.get("channel", "?"))
+        return True
+
+    def _perform_update(self, staging_dir: str, channel: str):
+        """
+        Apply a staged Maestro update: swap BIN_DIR's contents with the
+        already-downloaded-and-validated staged files, then re-exec tray.py
+        itself so a change to tray.py itself also takes effect (not just
+        main.py/daemon.py, which a simple main.py-only restart would miss).
+
+        No backup is kept after a successful swap — by design (see
+        MAESTRO_GUIDE.md "Update Maestro" planned-feature notes: automatic
+        backup/rollback was explicitly declined to keep this feature simple).
+        The old bin/ is moved aside only transiently, so a failure mid-swap
+        can still be recovered from automatically.
+
+        data/ is never touched by any part of this update path.
+        """
+        staging = Path(staging_dir)
+        if not staging.is_dir():
+            print(f"[tray] ✕ Update failed — staging dir missing: {staging_dir}", file=sys.stderr)
+            _notify("Maestro update failed", "Staged files were not found.")
+            self._update_icon(self.STATE_DOWN)
+            return
+
+        print(f"[tray] ↻ Applying {channel} update from {staging_dir}…", file=sys.stderr)
+        swap_tmp = BIN_DIR.parent / f"bin_swap_tmp_{int(time.time())}"
+        try:
+            # Step 1: move the current bin/ out of the way
+            shutil.move(str(BIN_DIR), str(swap_tmp))
+            # Step 2: move the staged files into place as the new bin/
+            shutil.move(str(staging), str(BIN_DIR))
+            # Step 3: drop the old files — no backup retention, by design
+            shutil.rmtree(swap_tmp, ignore_errors=True)
+        except Exception as ex:
+            print(f"[tray] ✕ Update swap failed: {ex}", file=sys.stderr)
+            _notify("Maestro update failed", str(ex))
+            # Best-effort restore if step 1 succeeded but step 2 didn't,
+            # so a failed update never leaves bin/ missing entirely.
+            if swap_tmp.exists() and not BIN_DIR.exists():
+                try: shutil.move(str(swap_tmp), str(BIN_DIR))
+                except Exception: pass
+            self._update_icon(self.STATE_DOWN)
+            return
+
+        print(f"[tray] ✓ Update applied — restarting for {channel}", file=sys.stderr)
+        _notify("Maestro", f"Update applied ({channel}). Restarting…")
+        self._reexec_self()
+
+    def _reexec_self(self):
+        """
+        Restart tray.py itself from scratch so any change to tray.py's own
+        source (just swapped into BIN_DIR) takes effect — not just
+        main.py/daemon.py, which _restart() alone would relaunch.
+
+        Linux: os.execv replaces this process's image in place — clean,
+        no lingering interpreter, matches start.py's own reasoning for
+        preferring execv over Popen+exit on Unix.
+        Windows: cannot cleanly execv a GUI/message-loop process the same
+        way — spawn a fresh process pointing at the (already swapped-in)
+        new tray.py, then exit this one.
+        """
+        args = [sys.executable, str(BIN_DIR / "tray.py"), "--bin-dir", str(BIN_DIR)]
+        if _WIN:
+            subprocess.Popen(args, cwd=str(BIN_DIR))
+            os._exit(0)
+        else:
+            os.chdir(str(BIN_DIR))
+            os.execv(sys.executable, args)
 
     # ── Health check loop ──────────────────────────────────────────────────────
     def _health_loop(self):
