@@ -14,10 +14,10 @@ Responsibilities:
 Process management, SSE, config I/O → daemon.py
 """
 import http.server, json, os, queue, shutil, signal
-import subprocess, sys, tempfile, threading, time, zipfile
+import subprocess, sys, tempfile, threading, time, zipfile, re, base64
 import urllib.request
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, quote
 
 import daemon
 
@@ -200,6 +200,37 @@ def _stage_update(channel: str) -> Path:
         except Exception: pass
         shutil.rmtree(extract_dir, ignore_errors=True)
 
+
+_VERSION_BADGE_RE = re.compile(r'class="ver">v([0-9][0-9A-Za-z.\-]*)')
+
+
+def _read_local_badge_version() -> str:
+    """Read the currently-running ui.html's version badge straight off disk."""
+    try:
+        html = UI_FILE.read_text(encoding="utf-8", errors="replace")
+        m = _VERSION_BADGE_RE.search(html)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+
+def _fetch_remote_badge_version(ref: str, token: str) -> str:
+    """
+    Fetch just ui.html's version badge at the given git ref (branch or tag)
+    via the GitHub Contents API — a single small authenticated call, no need
+    to download a whole zip just to check a version number.
+    """
+    url = f"https://api.github.com/repos/{_GITHUB_REPO}/contents/ui.html?ref={quote(ref)}"
+    data = _github_api_get_json(url, token)
+    content_b64 = data.get("content", "")
+    if not content_b64:
+        raise RuntimeError("GitHub API did not return ui.html's content")
+    html = base64.b64decode(content_b64).decode("utf-8", errors="replace")
+    m = _VERSION_BADGE_RE.search(html)
+    if not m:
+        raise RuntimeError("Could not find a version badge in the remote ui.html")
+    return m.group(1)
+
 # ── Settings ───────────────────────────────────────────────────────────────────
 _DEFAULT_SETTINGS: dict = {
     "fileExplorer":        False,
@@ -336,6 +367,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._read_file()
         elif path == "/api/settings":
             self._json(_settings)
+        elif path == "/api/update-check":
+            self._api_update_check()
         elif path.startswith("/img/"):
             fn  = Path(path[len("/img/"):]).name
             ext = fn.rsplit(".", 1)[-1].lower() if "." in fn else ""
@@ -537,6 +570,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"path": str(p), "name": p.name, "content": content, "ext": ext})
         except PermissionError:
             self._json({"error": "permission denied"})
+
+    def _api_update_check(self):
+        """
+        GET /api/update-check?channel=stable|latest
+        Compares the locally-running ui.html's version badge against the
+        same badge at the channel's remote ref (latest Release tag for
+        "stable", "main" HEAD for "latest") — a single small authenticated
+        GitHub Contents API call, not a full zip download. Uses the
+        githubToken setting server-side, so this works against a private
+        repo (unlike a client-side fetch straight from the browser, which
+        can't carry the token without exposing it).
+        """
+        qs = parse_qs(urlparse(self.path).query)
+        channel = qs.get("channel", [""])[0]
+        if channel not in ("stable", "latest"):
+            self._err(400, "channel must be 'stable' or 'latest'")
+            return
+
+        token = str(_settings.get("githubToken", "")).strip()
+        try:
+            if channel == "latest":
+                ref = "main"
+            else:
+                data = _github_api_get_json(_GITHUB_RELEASES_API, token)
+                ref = data.get("tag_name", "")
+                if not ref:
+                    raise RuntimeError("GitHub API did not return a tag_name for the latest release")
+
+            remote_ver = _fetch_remote_badge_version(ref, token)
+            local_ver  = _read_local_badge_version()
+            available  = bool(remote_ver) and remote_ver != local_ver
+
+            if available:
+                message = f"v{remote_ver} available (you have v{local_ver or '?'})"
+            else:
+                message = f"Already up to date (v{local_ver or remote_ver})"
+
+            self._json({
+                "ok":            True,
+                "channel":       channel,
+                "available":     available,
+                "remoteVersion": remote_ver,
+                "localVersion":  local_ver,
+                "message":       message,
+            })
+        except Exception as ex:
+            self._json({"ok": False, "error": str(ex)})
 
     # ── POST handlers ──────────────────────────────────────────────────────────
     def _launch(self, b: dict):

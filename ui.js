@@ -375,6 +375,14 @@ function _onReconnected(){
 }
 
 function updateFooterForActiveTab(){
+  // BUGFIX: this runs every ~2s via poll()'s loop, completely independent of
+  // mouse state. It used to unconditionally hide #ftr-tip and restore the
+  // default quote/webapp-url text — so a tooltip shown via ftrTip() while
+  // hovering would get yanked away mid-hover the next time poll() fired,
+  // even though the mouse never left the element (mouseout never fired).
+  // Skip entirely while a tooltip is actively shown; the mouseout handler
+  // is what's responsible for restoring the footer once the hover ends.
+  if(fT.classList.contains('show')) return;
   const s=document.getElementById('ftr-status');
   if(!activeTab||!isWebapp(activeTab)){
     fUrl.classList.remove('show');fQ.classList.remove('hide');fT.classList.remove('show');
@@ -1107,50 +1115,53 @@ async function doUpdateMaestro(channel){
   }
 }
 
-// Lightweight, client-side-only "is a newer Stable release available?" check.
-// Runs when the Settings modal opens — hits the GitHub API directly from the
-// browser (no backend involvement), so it costs nothing on the poll loop and
-// needs no server-side version tracking. Only the Stable channel is checked:
-// Latest always tracks main directly, so there's no meaningful "behind/ahead"
-// state to detect there without extra infra this feature doesn't need yet.
-async function _checkUpdateAvailable(){
-  const box=document.getElementById('sm-update-status');if(!box)return;
-  box.textContent='Checking for updates…';
-  try{
-    const res=await fetch(
-      'https://api.github.com/repos/AIdevelopmentPit/Maestro/releases/latest',
-      {signal:AbortSignal.timeout(10000)}
-    );
-    if(res.status===404){
-      // Most likely a private repo — this check is deliberately unauthenticated
-      // (it runs in the browser; a token would have to leave the server to get
-      // here, which isn't worth it just for this lightweight nice-to-have).
-      // The actual update buttons below use main.py's server-side githubToken
-      // setting instead, so they still work fine against a private repo.
-      box.textContent='Can\'t check (repo is private or renamed) — use the buttons below directly.';
-      return;
+// Builds one row of the Update Maestro section: a single button that starts
+// as "CHECK <LABEL>", runs GET /api/update-check?channel=... on click (using
+// main.py's server-side githubToken — works against a private repo, unlike
+// a client-side GitHub API call), shows the result message below, and — only
+// if an update is actually available — turns into a highlighted "UPDATE NOW"
+// button that triggers the real update on its next click. Nothing runs
+// automatically; the check only fires on the user's first click, per-channel.
+function _buildUpdateRow(channel,label){
+  const wrap=el('div','');wrap.style.cssText='display:flex;flex-direction:column;gap:4px';
+  const btn=el('button','sm-btn');
+  btn.textContent=`CHECK ${label.toUpperCase()}`;
+  btn.dataset.state='check';
+  const msg=el('div','finfo');msg.textContent='';
+
+  btn.onclick=async()=>{
+    if(btn.dataset.state==='update'){ doUpdateMaestro(channel); return; }
+    const prevLabel=btn.textContent;
+    btn.disabled=true;btn.textContent='Checking…';
+    try{
+      const r=await api('GET',`/api/update-check?channel=${channel}`);
+      if(r&&r.ok){
+        msg.textContent=r.message||'';
+        if(r.available){
+          btn.dataset.state='update';
+          btn.textContent='⬆ UPDATE NOW';
+          btn.style.background='var(--grn)';btn.style.color='#0a1a0a';btn.style.borderColor='var(--grn)';
+        }else{
+          btn.dataset.state='check';
+          btn.textContent=`CHECK ${label.toUpperCase()}`;
+          btn.style.background='';btn.style.color='';btn.style.borderColor='';
+        }
+      }else{
+        console.error('Update check failed:',r);
+        msg.textContent='Check failed: '+((r&&r.error)||'?');
+        btn.textContent=prevLabel;
+      }
+    }catch(ex){
+      console.error('Update check failed:',ex);
+      msg.textContent='Check failed: '+String(ex);
+      btn.textContent=prevLabel;
+    }finally{
+      btn.disabled=false;
     }
-    if(res.status===403){
-      const reset=res.headers.get('x-ratelimit-reset');
-      const when=reset?new Date(parseInt(reset)*1000).toLocaleTimeString():'later';
-      box.textContent=`GitHub API rate-limited — try again after ${when}.`;
-      return;
-    }
-    if(!res.ok) throw new Error('GitHub API error '+res.status);
-    const data=await res.json();
-    const latestTag=(data.tag_name||'').replace(/^v/,'');
-    const curVer=(document.querySelector('.ver')?.textContent||'').replace(/^v/,'');
-    if(latestTag&&curVer&&latestTag!==curVer){
-      box.innerHTML=`⚠ Stable release <b>v${latestTag}</b> is available (you're on v${curVer})`;
-    }else if(latestTag){
-      box.textContent=`✓ You're on the latest Stable tag (v${curVer})`;
-    }else{
-      box.textContent='';
-    }
-  }catch(ex){
-    console.error('Update check failed:',ex);
-    box.textContent='Could not check for updates: '+String(ex);
-  }
+  };
+
+  wrap.append(btn,msg);
+  return wrap;
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────────
@@ -1168,6 +1179,25 @@ function openSettings(){
   _fetchSettings().then(s=>{
     const body=document.getElementById('settings-modal-body');
     body.innerHTML='';
+
+    // ── Support section (moved to the top, no section title, per project owner's request) ──
+    const secSupport=el('div','sm-section');
+    const supportRow=el('div','sm-links-row');
+    const btnSupport=el('a','sm-btn');
+    btnSupport.href='https://github.com/sponsors/apellaman/';btnSupport.target='_blank';
+    btnSupport.textContent='💛 Support me on Github';
+    const btnStar=el('a','sm-btn');
+    btnStar.href='https://github.com/AIdevelopmentPit/Maestro';btnStar.target='_blank';
+    btnStar.textContent='⭐ Star me on GitHub';
+    // NOTE: GitHub does not offer any URL/deep-link that stars a repo on
+    // click — starring is an authenticated POST action with no anonymous
+    // equivalent. This opens the repo page (where the visitor can star it
+    // themselves in one click) rather than actually starring it automatically.
+    supportRow.append(btnSupport,btnStar);
+    const supportDesc=el('div','sm-footer');
+    supportDesc.textContent='Maestro is developed and maintained by only one person, please consider to donate if you are using it on a daily basis.';
+    secSupport.append(supportRow,supportDesc);
+    body.appendChild(secSupport);
 
     // ── General section ────────────────────────────────────────────────────────
     const secGen=_smSection('General');
@@ -1214,12 +1244,14 @@ function openSettings(){
       await _fetchSettings();
       setStatus('Server settings saved — restart to apply');
     };
-    secSrv.append(hostInp,portInp,warnDiv,saveSrvBtn);
+    secSrv.append(hostInp._wrap,portInp._wrap,warnDiv,saveSrvBtn);
     body.appendChild(secSrv);
 
     // ── Update Maestro section ─────────────────────────────────────────────────
+    // Stable and Latest each get their own independent check — nothing runs
+    // automatically on modal open; the check for a channel only fires the
+    // first time its button is clicked (see _buildUpdateRow above).
     const secUpd=_smSection('Update Maestro');
-    const updStatus=el('div','finfo');updStatus.id='sm-update-status';updStatus.textContent='';
     const tokenInp=_smInput('GitHub Token (only needed while the repo is private)','password',s.githubToken||'');
     tokenInp.placeholder='ghp_… (leave empty once the repo is public)';
     const btnSaveToken=el('button','rbtn sec');btnSaveToken.textContent='Save Token';
@@ -1230,30 +1262,13 @@ function openSettings(){
       setStatus('GitHub token saved.');
     };
     const updWarn=el('div','sm-warn');
-    updWarn.textContent='⚠ Stops ALL running scripts and restarts Maestro. No automatic backup is kept.';
-    const updRow=el('div','sm-links-row');
-    const btnStable=el('button','sm-btn');btnStable.textContent='⬆ Update Stable';
-    btnStable.onclick=()=>doUpdateMaestro('stable');
-    const btnLatest=el('button','sm-btn');btnLatest.textContent='⬆ Update Latest';
-    btnLatest.onclick=()=>doUpdateMaestro('latest');
-    updRow.append(btnStable,btnLatest);
-    secUpd.append(updStatus,tokenInp,btnSaveToken,updWarn,updRow);
+    updWarn.textContent='⚠ Updating stops ALL running scripts and restarts Maestro. No automatic backup is kept.';
+    secUpd.append(
+      tokenInp._wrap,btnSaveToken,updWarn,
+      _buildUpdateRow('stable','Stable'),
+      _buildUpdateRow('latest','Latest'),
+    );
     body.appendChild(secUpd);
-    _checkUpdateAvailable();   // fire-and-forget, client-side only (see function docstring)
-
-    // ── Links section ──────────────────────────────────────────────────────────
-    const secLinks=_smSection('Links');
-    const linksRow=el('div','sm-links-row');
-    const gh=el('a','sm-link');gh.href='https://github.com/AIdevelopmentPit/Maestro';gh.target='_blank';gh.textContent='⭐ Open on GitHub';
-    const coffee=el('a','sm-btn');coffee.href='#';coffee.textContent='☕ Buy me a coffee';
-    linksRow.append(gh,coffee);
-    secLinks.appendChild(linksRow);
-    body.appendChild(secLinks);
-
-    // ── Footer ────────────────────────────────────────────────────────────────
-    const foot=el('div','sm-footer');
-    foot.textContent='This is an opensource, light, offline and privacy first tool made with QoL mindset for peace of mind';
-    body.appendChild(foot);
   });
 
   document.getElementById('settings-backdrop').classList.add('show');
@@ -1291,7 +1306,16 @@ function _smInput(label,type,value){
   i.id='sm-inp-'+label.toLowerCase().replace(/[^a-z0-9]+/g,'-');
   l.htmlFor=i.id;
   if(type==='number'){i.min='1';i.max='65535';}
-  w.append(l,i);return i;  // return input directly for access
+  w.append(l,i);
+  i._wrap=w;  // BUGFIX: w (containing the visible label) was created but never
+              // returned/appended anywhere — callers only ever got the bare
+              // input back, so every _smInput field rendered with no visible
+              // label at all. Host/Port got away with it because position and
+              // typical values made them guessable; the new GitHub Token field
+              // did not. Callers must append `i._wrap`, not `i` itself, to get
+              // the labeled version. `i` is still returned directly so
+              // `.value` reads/writes at call sites keep working unchanged.
+  return i;
 }
 
 // ── Explorer ──────────────────────────────────────────────────────────────────
