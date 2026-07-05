@@ -1121,6 +1121,15 @@ async function _checkUpdateAvailable(){
       'https://api.github.com/repos/AIdevelopmentPit/Maestro/releases/latest',
       {signal:AbortSignal.timeout(10000)}
     );
+    if(res.status===404){
+      // Most likely a private repo — this check is deliberately unauthenticated
+      // (it runs in the browser; a token would have to leave the server to get
+      // here, which isn't worth it just for this lightweight nice-to-have).
+      // The actual update buttons below use main.py's server-side githubToken
+      // setting instead, so they still work fine against a private repo.
+      box.textContent='Can\'t check (repo is private or renamed) — use the buttons below directly.';
+      return;
+    }
     if(res.status===403){
       const reset=res.headers.get('x-ratelimit-reset');
       const when=reset?new Date(parseInt(reset)*1000).toLocaleTimeString():'later';
@@ -1211,6 +1220,15 @@ function openSettings(){
     // ── Update Maestro section ─────────────────────────────────────────────────
     const secUpd=_smSection('Update Maestro');
     const updStatus=el('div','finfo');updStatus.id='sm-update-status';updStatus.textContent='';
+    const tokenInp=_smInput('GitHub Token (only needed while the repo is private)','password',s.githubToken||'');
+    tokenInp.placeholder='ghp_… (leave empty once the repo is public)';
+    const btnSaveToken=el('button','rbtn sec');btnSaveToken.textContent='Save Token';
+    btnSaveToken.style.marginTop='4px';
+    btnSaveToken.onclick=async()=>{
+      await api('POST','/api/settings',{githubToken:tokenInp.value.trim()});
+      await _fetchSettings();
+      setStatus('GitHub token saved.');
+    };
     const updWarn=el('div','sm-warn');
     updWarn.textContent='⚠ Stops ALL running scripts and restarts Maestro. No automatic backup is kept.';
     const updRow=el('div','sm-links-row');
@@ -1219,7 +1237,7 @@ function openSettings(){
     const btnLatest=el('button','sm-btn');btnLatest.textContent='⬆ Update Latest';
     btnLatest.onclick=()=>doUpdateMaestro('latest');
     updRow.append(btnStable,btnLatest);
-    secUpd.append(updStatus,updWarn,updRow);
+    secUpd.append(updStatus,tokenInp,btnSaveToken,updWarn,updRow);
     body.appendChild(secUpd);
     _checkUpdateAvailable();   // fire-and-forget, client-side only (see function docstring)
 

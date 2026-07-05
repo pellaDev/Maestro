@@ -52,8 +52,8 @@ _TEXT_EXTS = {
 # tray.py's own file may have changed) is handled by tray.py, triggered via
 # a marker file in DATA_DIR that tray.py checks after main.py exits.
 _GITHUB_REPO           = "AIdevelopmentPit/Maestro"
-_GITHUB_LATEST_ZIP_URL = f"https://github.com/{_GITHUB_REPO}/archive/refs/heads/main.zip"
 _GITHUB_RELEASES_API   = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
+_GITHUB_LATEST_ZIP_API = f"https://api.github.com/repos/{_GITHUB_REPO}/zipball/main"
 _UPDATE_MARKER_NAME    = "update_request.json"
 
 # Runtime files copied from the downloaded zip into the clean staging dir —
@@ -71,18 +71,68 @@ _UPDATE_SRC_IMG_FILES = [
 ]
 
 
-def _resolve_update_zip_url(channel: str) -> str:
-    """Resolve the source zip download URL for the given update channel."""
-    if channel == "latest":
-        return _GITHUB_LATEST_ZIP_URL
-    # stable: ask the GitHub API for the latest tagged Release's zipball.
-    # User-Agent is required by GitHub's API or the request is rejected.
-    req = urllib.request.Request(
-        _GITHUB_RELEASES_API,
-        headers={"User-Agent": "Maestro-Updater", "Accept": "application/vnd.github+json"},
-    )
+class _NoRedirectHandler(urllib.request.HTTPErrorProcessor):
+    """
+    Passes 30x responses straight through instead of following them.
+    Needed because GitHub's zipball API redirects (api.github.com →
+    codeload.github.com / objects.githubusercontent.com) to a pre-signed,
+    unauthenticated URL — and urllib's default redirect handling silently
+    drops the Authorization header on any cross-host redirect. Letting the
+    redirect through lets us grab the Location header ourselves and fetch
+    the actual bytes with NO auth header, which is what the signed URL
+    expects anyway.
+    """
+    def http_response(self, request, response):
+        return response
+    https_response = http_response
+
+
+def _github_auth_headers(token: str) -> dict:
+    h = {"User-Agent": "Maestro-Updater", "Accept": "application/vnd.github+json"}
+    if token:
+        h["Authorization"] = f"token {token}"
+    return h
+
+
+def _github_api_get_json(url: str, token: str) -> dict:
+    req = urllib.request.Request(url, headers=_github_auth_headers(token))
     with urllib.request.urlopen(req, timeout=15) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _github_download_zip(url: str, token: str, dest_path: str):
+    """
+    Download a GitHub zipball URL to dest_path, manually following at most
+    one redirect without carrying the Authorization header across it —
+    see _NoRedirectHandler docstring for why this can't just be a plain
+    urlopen() call when a token is involved.
+    """
+    opener = urllib.request.build_opener(_NoRedirectHandler)
+    req = urllib.request.Request(url, headers=_github_auth_headers(token))
+    resp = opener.open(req, timeout=30)
+    try:
+        if resp.status in (301, 302, 303, 307, 308):
+            location = resp.headers.get("Location")
+            if not location:
+                raise RuntimeError(f"GitHub redirect ({resp.status}) had no Location header")
+            with urllib.request.urlopen(location, timeout=60) as final_resp, open(dest_path, "wb") as f:
+                shutil.copyfileobj(final_resp, f)
+        elif resp.status == 200:
+            with open(dest_path, "wb") as f:
+                shutil.copyfileobj(resp, f)
+        else:
+            raise RuntimeError(f"Unexpected status {resp.status} downloading update zip")
+    finally:
+        resp.close()
+
+
+def _resolve_update_zip_api_url(channel: str, token: str) -> str:
+    """Resolve the GitHub zipball API URL for the given update channel."""
+    if channel == "latest":
+        return _GITHUB_LATEST_ZIP_API
+    # stable: ask the GitHub API for the latest tagged Release's zipball URL
+    # (itself another api.github.com zipball endpoint — same auth handling).
+    data = _github_api_get_json(_GITHUB_RELEASES_API, token)
     url = data.get("zipball_url", "")
     if not url:
         raise RuntimeError("GitHub API did not return a zipball_url for the latest release")
@@ -95,13 +145,18 @@ def _stage_update(channel: str) -> Path:
     contains the expected core files, and copy the known runtime file set
     into a clean staging directory.
 
+    Uses the githubToken setting (if configured) for private-repo access —
+    see MAESTRO_GUIDE.md for why the token never leaves the server side
+    (main.py / settings.json only; never sent to the browser).
+
     Never touches BASE_DIR/bin — safe to call before deciding to restart.
     Returns the staging directory path on success.
     Raises RuntimeError (or lets the underlying exception propagate) with a
     human-readable message on any failure; the staging dir is cleaned up
     before raising so no partial state is left behind.
     """
-    url = _resolve_update_zip_url(channel)
+    token = str(_settings.get("githubToken", "")).strip()
+    url = _resolve_update_zip_api_url(channel, token)
 
     tmp_zip_fd, tmp_zip_path = tempfile.mkstemp(suffix=".zip")
     os.close(tmp_zip_fd)
@@ -109,9 +164,7 @@ def _stage_update(channel: str) -> Path:
     staging_dir = Path(tempfile.mkdtemp(prefix="maestro_update_stage_"))
 
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Maestro-Updater"})
-        with urllib.request.urlopen(req, timeout=60) as resp, open(tmp_zip_path, "wb") as f:
-            shutil.copyfileobj(resp, f)
+        _github_download_zip(url, token, tmp_zip_path)
 
         with zipfile.ZipFile(tmp_zip_path) as zf:
             zf.extractall(extract_dir)
@@ -158,6 +211,7 @@ _DEFAULT_SETTINGS: dict = {
     "host":                "127.0.0.1",
     "port":                8865,
     "dataDir":             "",
+    "githubToken":         "",
 }
 
 # Populated by _load_settings() in main() — do not access before that point.
