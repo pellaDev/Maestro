@@ -1068,8 +1068,32 @@ async function doUpdateMaestro(channel){
     `This will stop ALL running scripts and restart Maestro. `+
     `No automatic backup is kept.`
   )) return;
-  setStatus(`Downloading ${channel} update…`);
-  const r=await api('POST','/api/update-maestro',{channel});
+
+  // NOTE: this deliberately does NOT use api() — api()'s AbortSignal.timeout
+  // is hardcoded to API_TIMEOUT_MS (6s), tuned for ordinary fast calls. The
+  // server-side work here (download + extract + validate a GitHub zip) can
+  // legitimately take well beyond 6s, and a client-side abort at 6s was
+  // silently killing every update attempt with no visible error — the fetch
+  // rejected, the fallback status message flashed for only 3.5s in the small
+  // footer text, and it looked exactly like "clicking Update does nothing".
+  _footerAlert(`⬇ Downloading ${channel} update… this can take up to a minute`,
+    {color:'var(--acc4)',bold:true,autoClear:false});
+
+  let r;
+  try{
+    const res=await fetch('/api/update-maestro',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({channel}),
+      signal:AbortSignal.timeout(120000),
+    });
+    r=await res.json();
+  }catch(ex){
+    console.error('Update Maestro request failed:',ex);
+    _footerAlert('✕ Update failed: '+String(ex),{color:'var(--red)',bold:true,duration:8000});
+    return;
+  }
+
   if(r&&r.ok){
     Object.values(sseConns).forEach(es=>es.close());sseConns={};sessionStorage.clear();
     document.body.innerHTML=
@@ -1078,7 +1102,8 @@ async function doUpdateMaestro(channel){
       'Updating Maestro…<br><small style="font-size:12px">'+
       'Restarting to apply the update — reload this page in a few seconds.</small></div>';
   } else {
-    setStatus('Update failed: '+((r&&r.error)||'?'));
+    console.error('Update Maestro failed:',r);
+    _footerAlert('✕ Update failed: '+((r&&r.error)||'?'),{color:'var(--red)',bold:true,duration:8000});
   }
 }
 
@@ -1094,8 +1119,14 @@ async function _checkUpdateAvailable(){
   try{
     const res=await fetch(
       'https://api.github.com/repos/AIdevelopmentPit/Maestro/releases/latest',
-      {signal:AbortSignal.timeout(6000)}
+      {signal:AbortSignal.timeout(10000)}
     );
+    if(res.status===403){
+      const reset=res.headers.get('x-ratelimit-reset');
+      const when=reset?new Date(parseInt(reset)*1000).toLocaleTimeString():'later';
+      box.textContent=`GitHub API rate-limited — try again after ${when}.`;
+      return;
+    }
     if(!res.ok) throw new Error('GitHub API error '+res.status);
     const data=await res.json();
     const latestTag=(data.tag_name||'').replace(/^v/,'');
@@ -1108,7 +1139,8 @@ async function _checkUpdateAvailable(){
       box.textContent='';
     }
   }catch(ex){
-    box.textContent='Could not check for updates (offline or rate-limited).';
+    console.error('Update check failed:',ex);
+    box.textContent='Could not check for updates: '+String(ex);
   }
 }
 
