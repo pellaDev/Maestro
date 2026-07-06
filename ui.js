@@ -1064,13 +1064,16 @@ function doAddSep(){
 }
 
 // ── Update Maestro (Settings modal) ───────────────────────────────────────────
-// Applies a full Maestro update from GitHub — either the "stable" channel
-// (latest tagged Release) or "latest" (main branch HEAD). See main.py's
-// /api/update-maestro and tray.py's _perform_update()/_reexec_self() for the
-// server-side download/stage/swap/restart sequence. This stops ALL running
-// managed scripts (full-stack restart, by design — see MAESTRO_GUIDE.md).
+// Applies a full Maestro update from GitHub — either channel "release"
+// (the latest tagged GitHub Release — labeled "Latest" in the UI, matching
+// GitHub's own flag for it) or "main" (main branch HEAD — labeled
+// "Pre-release" in the UI, matching GitHub's vocabulary for anything that
+// isn't the flagged Latest release). See main.py's /api/update-maestro and
+// tray.py's _perform_update()/_reexec_self() for the server-side
+// download/stage/swap/restart sequence. This stops ALL running managed
+// scripts (full-stack restart, by design — see MAESTRO_GUIDE.md).
 async function doUpdateMaestro(channel){
-  const label=channel==='stable'?'Stable (latest tagged release)':'Latest (main branch)';
+  const label=channel==='release'?'Latest (tagged release)':'Pre-release (main branch)';
   if(!confirm(
     `Update Maestro to ${label}?\n\n`+
     `This will stop ALL running scripts and restart Maestro. `+
@@ -1248,9 +1251,10 @@ function openSettings(){
     body.appendChild(secSrv);
 
     // ── Update Maestro section ─────────────────────────────────────────────────
-    // Stable and Latest each get their own independent check — nothing runs
-    // automatically on modal open; the check for a channel only fires the
-    // first time its button is clicked (see _buildUpdateRow above).
+    // Latest (tagged release) and Pre-release (main branch) each get their
+    // own independent check — nothing runs automatically on modal open; the
+    // check for a channel only fires the first time its button is clicked
+    // (see _buildUpdateRow above).
     const secUpd=_smSection('Update Maestro');
     const tokenInp=_smInput('GitHub Token (only needed while the repo is private)','password',s.githubToken||'');
     tokenInp.placeholder='ghp_… (leave empty once the repo is public)';
@@ -1265,8 +1269,8 @@ function openSettings(){
     updWarn.textContent='⚠ Updating stops ALL running scripts and restarts Maestro. No automatic backup is kept.';
     secUpd.append(
       tokenInp._wrap,btnSaveToken,updWarn,
-      _buildUpdateRow('stable','Stable'),
-      _buildUpdateRow('latest','Latest'),
+      _buildUpdateRow('release','Latest'),
+      _buildUpdateRow('main','Pre-release'),
     );
     body.appendChild(secUpd);
   });

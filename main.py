@@ -44,17 +44,30 @@ _TEXT_EXTS = {
     '.c', '.cpp', '.h', '.rs', '.go', '.rb', '.php', '.java', '.kt', '',
 }
 
-# ── Update Maestro (Settings modal "Update Stable" / "Update Latest") ─────────
+# ── Update Maestro (Settings modal "Update Latest" / "Update Pre-release") ────
 # See MAESTRO_GUIDE.md → "Update Maestro" feature section for the full design
 # rationale. Summary: main.py only downloads + validates + stages the new
 # files into a clean temp directory — it never touches bin/ itself. The
 # actual bin/ swap and full-stack restart (including tray.py re-exec, since
 # tray.py's own file may have changed) is handled by tray.py, triggered via
 # a marker file in DATA_DIR that tray.py checks after main.py exits.
-_GITHUB_REPO           = "AIdevelopmentPit/Maestro"
-_GITHUB_RELEASES_API   = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
-_GITHUB_LATEST_ZIP_API = f"https://api.github.com/repos/{_GITHUB_REPO}/zipball/main"
-_UPDATE_MARKER_NAME    = "update_request.json"
+#
+# Channel naming: aligned to GitHub's own vocabulary, not an arbitrary
+# Maestro-only scheme — GitHub itself flags the newest non-prerelease tagged
+# Release as "Latest" and anything else as "Pre-release". So:
+#   channel="release" -> the latest tagged GitHub Release   -> UI label "Latest"
+#   channel="main"    -> the main branch HEAD (bleeding edge) -> UI label "Pre-release"
+# These internal values are deliberately NOT called "stable"/"latest"
+# themselves — using an adjective as the internal identifier while a
+# DIFFERENT UI label describing the same channel also exists (e.g. internal
+# "latest" meaning main-branch while the UI says "Pre-release" for it) is
+# exactly the kind of self-contradicting naming this rename was meant to
+# eliminate. "release"/"main" describe what the channel actually IS, not an
+# adjective about its quality — the UI label does that job instead.
+_GITHUB_REPO         = "AIdevelopmentPit/Maestro"
+_GITHUB_RELEASES_API = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
+_GITHUB_MAIN_ZIP_API = f"https://api.github.com/repos/{_GITHUB_REPO}/zipball/main"
+_UPDATE_MARKER_NAME  = "update_request.json"
 
 # Runtime files copied from the downloaded zip into the clean staging dir —
 # intentionally mirrors install.sh / install.py's SRC_FILES so an update
@@ -128,10 +141,10 @@ def _github_download_zip(url: str, token: str, dest_path: str):
 
 def _resolve_update_zip_api_url(channel: str, token: str) -> str:
     """Resolve the GitHub zipball API URL for the given update channel."""
-    if channel == "latest":
-        return _GITHUB_LATEST_ZIP_API
-    # stable: ask the GitHub API for the latest tagged Release's zipball URL
-    # (itself another api.github.com zipball endpoint — same auth handling).
+    if channel == "main":
+        return _GITHUB_MAIN_ZIP_API
+    # channel == "release": ask the GitHub API for the latest tagged Release's
+    # zipball URL (itself another api.github.com zipball endpoint — same auth handling).
     data = _github_api_get_json(_GITHUB_RELEASES_API, token)
     url = data.get("zipball_url", "")
     if not url:
@@ -573,10 +586,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _api_update_check(self):
         """
-        GET /api/update-check?channel=stable|latest
+        GET /api/update-check?channel=release|main
         Compares the locally-running ui.html's version badge against the
         same badge at the channel's remote ref (latest Release tag for
-        "stable", "main" HEAD for "latest") — a single small authenticated
+        "release", "main" HEAD for "main") — a single small authenticated
         GitHub Contents API call, not a full zip download. Uses the
         githubToken setting server-side, so this works against a private
         repo (unlike a client-side fetch straight from the browser, which
@@ -584,13 +597,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """
         qs = parse_qs(urlparse(self.path).query)
         channel = qs.get("channel", [""])[0]
-        if channel not in ("stable", "latest"):
-            self._err(400, "channel must be 'stable' or 'latest'")
+        if channel not in ("release", "main"):
+            self._err(400, "channel must be 'release' or 'main'")
             return
 
         token = str(_settings.get("githubToken", "")).strip()
         try:
-            if channel == "latest":
+            if channel == "main":
                 ref = "main"
             else:
                 data = _github_api_get_json(_GITHUB_RELEASES_API, token)
@@ -906,7 +919,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _update_maestro(self, b: dict):
         """
         Download + stage a Maestro update from the requested channel
-        ("stable" = latest tagged Release, "latest" = main branch HEAD).
+        ("release" = latest tagged Release, UI label "Latest";
+         "main" = main branch HEAD, UI label "Pre-release").
 
         Responds only AFTER the download + extraction + validation have
         all succeeded — a failure (bad network, GitHub rate limit,
@@ -921,8 +935,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         (the marker file) and temp directories are written here.
         """
         channel = str(b.get("channel", "")).strip()
-        if channel not in ("stable", "latest"):
-            self._err(400, "channel must be 'stable' or 'latest'")
+        if channel not in ("release", "main"):
+            self._err(400, "channel must be 'release' or 'main'")
             return
 
         try:

@@ -31,8 +31,9 @@ Maestro is a personal tool for people who run multiple background scripts on a d
 - Per-process terminal panels with colour themes, crash detection, and auto-restart
 - WebApp iframe tabs for scripts that expose a web interface (ComfyUI, llama.cpp, etc.)
 - A file explorer and inline text editor for quick edits without leaving the UI
+- A one-click **Update Maestro** button (Settings) that pulls the Latest tagged release or the Pre-release main branch straight from GitHub
 
-Everything runs locally. Nothing leaves your machine.
+Everything runs locally. Nothing leaves your machine (aside from the update check/download itself talking to GitHub, when you use that feature).
 
 ---
 
@@ -51,7 +52,8 @@ Everything runs locally. Nothing leaves your machine.
 - **Separator rows** — group scripts with labelled dividers; optional attached text file
 - **File tree** — sidebar tree for quick navigation; full file explorer panel
 - **Unreachable detection** — scripts with missing files shown as unreachable; notified once per transition
-- **Settings modal** — toggle file explorer, logs recorder, autostart, open browser at launch, host/port
+- **Settings modal** — toggle file explorer, logs recorder, autostart, open browser at launch, host/port, GitHub token
+- **Update Maestro** — check for and install updates from either the Latest (tagged Release) or Pre-release (main branch) channel, directly from the Settings modal — no manual reinstall needed
 - **Single-instance lock** — platform temp dir `/MaestroWeb.pid`
 - **Atomic config writes** — `config.txt` and `settings.json` written via `tempfile + shutil.move`
 - **Zero pip, zero npm, zero CDN** — pure Python stdlib backend, vanilla JS frontend
@@ -123,27 +125,34 @@ Git Bash:            https://git-scm.com/download/win
 
 ## Install
 
-Maestro has two install channels — pick one when cloning below:
+Maestro has two install channels — pick one when cloning below. Naming
+matches GitHub's own release vocabulary directly (GitHub flags the newest
+tagged, non-prerelease Release as "Latest"; anything else is a "Pre-release"):
 
-- **Latest** — tracks the `main` branch directly. This is the primary,
-  most up-to-date channel; most development and testing happens here.
-- **Stable** — pinned to the most recent tagged
-  [GitHub Release](https://github.com/AIdevelopmentPit/Maestro/releases), a
-  frozen snapshot for anyone who'd rather not track `main` day-to-day.
+- **Latest** — the most recent tagged [GitHub Release](https://github.com/AIdevelopmentPit/Maestro/releases),
+  a pinned, finalized snapshot. Recommended for anyone who'd rather not
+  track `main` day-to-day.
+- **Pre-release** — tracks the `main` branch directly. This is where
+  day-to-day development happens; expect it to be ahead of Latest most of
+  the time, and occasionally less tested.
 
 Both channels use the exact same installer (`install.sh` / `install.py`) —
-the only difference is which commit you check out *before* running it.
+the only difference is which commit you check out *before* running it. Both
+are also installable/switchable later from inside the app itself, via the
+Settings modal's **Update Maestro** section (CHECK LATEST / CHECK
+PRE-RELEASE buttons) — no need to re-clone or reinstall by hand once
+Maestro is already running.
 
 ### Linux — from GitHub
 
-**Latest (main branch):**
+**Pre-release (main branch):**
 ```bash
 git clone https://github.com/AIdevelopmentPit/Maestro.git
 cd Maestro
 bash install.sh
 ```
 
-**Stable (latest tagged Release):**
+**Latest (most recent tagged Release):**
 ```bash
 git clone https://github.com/AIdevelopmentPit/Maestro.git
 cd Maestro
@@ -189,14 +198,14 @@ channel selection here, that only applies to the `git clone` paths above.
 
 Open **PowerShell** or **Command Prompt**:
 
-**Latest (main branch):**
+**Pre-release (main branch):**
 ```powershell
 git clone https://github.com/AIdevelopmentPit/Maestro.git
 cd Maestro
 python install.py
 ```
 
-**Stable (latest tagged Release):**
+**Latest (most recent tagged Release):**
 ```powershell
 git clone https://github.com/AIdevelopmentPit/Maestro.git
 cd Maestro
@@ -272,6 +281,17 @@ This launches `tray.py` (tray daemon + watchdog), which in turn launches `main.p
 
 Right-click the tray icon for: **Open in Browser**, **Restart Maestro**, **Autostart toggle**, **Shut Down**.
 
+### Updating Maestro
+
+From the running app: ⚙ **Settings → Update Maestro**. Two independent
+buttons, **CHECK LATEST** and **CHECK PRE-RELEASE** — clicking one checks
+that channel against what you have installed; if a newer version is found,
+the button turns into **⬆ UPDATE NOW**. Updating stops all running scripts
+and restarts Maestro (no automatic backup is kept). If the repo is private
+at the time you're reading this, you'll need a GitHub token in the same
+Settings section for this to work — see the repo's own visibility for
+whether that still applies.
+
 ---
 
 ## Config format (`config.txt`)
@@ -317,6 +337,7 @@ Located in `data/settings.json`. Edited via the ⚙ Settings modal in the UI.
 | `host` | `127.0.0.1` | HTTP bind address — set `0.0.0.0` for LAN access (no auth!) |
 | `port` | `8865` | HTTP port |
 | `dataDir` | `""` | Custom data directory path (empty = default `../data/`) |
+| `githubToken` | `""` | GitHub Personal Access Token — only needed for **Update Maestro** while the repo is private. Server-side only, never sent to the browser. |
 
 ---
 
@@ -367,4 +388,4 @@ Issues and PRs welcome. However, all contributions are governed by the terms des
 
 ## Support
 
-☕ [Buy me a coffee](#) *(link coming soon)*
+💛 [Support me on GitHub Sponsors](https://github.com/sponsors/apellaman/)
