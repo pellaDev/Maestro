@@ -71,9 +71,22 @@ _TEXT_EXTS = {
 }
 
 # ── Update Maestro (Settings modal "Update Latest" / "Update Pre-release") ────
+# Versioning convention (must stay in sync with .github/workflows/release.yml):
+#   vX.Y     (two numeric parts)   -> tagged as a normal GitHub Release (not
+#                                     prerelease). GitHub's own "Latest" flag
+#                                     always lands on the newest one of these.
+#   vX.Y.Z   (three numeric parts) -> tagged as a GitHub prerelease. Never
+#                                     eligible for the "Latest" flag, however
+#                                     recent.
+# "CHECK LATEST" only ever considers vX.Y tags (via GitHub's own
+# /releases/latest, which by definition excludes anything flagged
+# prerelease). "CHECK PRE-RELEASE" only ever considers vX.Y.Z tags (the most
+# recently published release explicitly flagged prerelease:true) — it no
+# longer looks at the main branch HEAD at all, so an untagged commit on main
+# is invisible to both channels until it's cut as a vX.Y.Z (or vX.Y) tag.
 _GITHUB_REPO         = "AIdevelopmentPit/Maestro"
 _GITHUB_RELEASES_API = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
-_GITHUB_MAIN_ZIP_API = f"https://api.github.com/repos/{_GITHUB_REPO}/zipball/main"
+_GITHUB_ALL_RELEASES_API = f"https://api.github.com/repos/{_GITHUB_REPO}/releases"
 _UPDATE_MARKER_NAME  = "update_request.json"
 
 _UPDATE_SRC_FILES = [
@@ -131,13 +144,39 @@ def _github_download_zip(url: str, token: str, dest_path: str):
         resp.close()
 
 
+def _github_resolve_channel_release(channel: str, token: str) -> dict:
+    """
+    Return the GitHub release JSON (tag_name, zipball_url, ...) for the
+    requested channel:
+      - "release" (Latest)      -> GitHub's own /releases/latest — this
+        endpoint is defined by GitHub itself to exclude anything flagged
+        prerelease, so it always resolves to the newest vX.Y tag.
+      - "main" (Pre-release)    -> the most recently published release that
+        is explicitly flagged prerelease:true (a vX.Y.Z tag, per the
+        tagging convention enforced by release.yml). Raises if none exists.
+    """
+    if channel == "release":
+        return _github_api_get_json(_GITHUB_RELEASES_API, token)
+
+    # Pre-release: /releases (list) is already sorted newest-first by
+    # creation date — take the first one flagged prerelease:true.
+    releases = _github_api_get_json(_GITHUB_ALL_RELEASES_API, token)
+    if not isinstance(releases, list):
+        raise RuntimeError("GitHub API did not return a release list")
+    for rel in releases:
+        if rel.get("prerelease"):
+            return rel
+    raise RuntimeError(
+        "No pre-release (vX.Y.Z) tag found on GitHub — cut one with "
+        "'git tag vX.Y.Z && git push origin vX.Y.Z' first."
+    )
+
+
 def _resolve_update_zip_api_url(channel: str, token: str) -> str:
-    if channel == "main":
-        return _GITHUB_MAIN_ZIP_API
-    data = _github_api_get_json(_GITHUB_RELEASES_API, token)
-    url = data.get("zipball_url", "")
+    rel = _github_resolve_channel_release(channel, token)
+    url = rel.get("zipball_url", "")
     if not url:
-        raise RuntimeError("GitHub API did not return a zipball_url for the latest release")
+        raise RuntimeError(f"GitHub API did not return a zipball_url for channel '{channel}'")
     return url
 
 
@@ -662,13 +701,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         token = str(_settings.get("githubToken", "")).strip()
         try:
-            if channel == "main":
-                ref = "main"
-            else:
-                data = _github_api_get_json(_GITHUB_RELEASES_API, token)
-                ref = data.get("tag_name", "")
-                if not ref:
-                    raise RuntimeError("GitHub API did not return a tag_name for the latest release")
+            rel = _github_resolve_channel_release(channel, token)
+            ref = rel.get("tag_name", "")
+            if not ref:
+                raise RuntimeError(f"GitHub API did not return a tag_name for channel '{channel}'")
 
             remote_ver = _fetch_remote_badge_version(ref, token)
             local_ver  = _read_local_badge_version()

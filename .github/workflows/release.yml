@@ -1,17 +1,37 @@
 # Path: .github/workflows/release.yml
 #
-# Triggers on any pushed tag matching v* (e.g. v2.1, v2.2, v3.0) and creates
-# a GitHub Release for it automatically, with auto-generated release notes.
+# Triggers on any pushed tag matching v* (e.g. v2.1, v2.2, v3.0, v2.2.1,
+# v2.2.2) and creates a GitHub Release for it automatically, with
+# auto-generated release notes.
 #
-# This is the "Stable" channel for the future in-app "Update Maestro" feature:
-#   - UPDATE STABLE will pull the latest tagged Release created by this workflow
-#   - UPDATE LATEST will keep pulling the main branch zip directly (no Release involved)
+# Versioning / channel convention (must stay in sync with main.py's
+# _github_resolve_channel_release and MAESTRO_GUIDE.md):
+#   vX.Y     (two numeric parts)   -> tagged as a normal Release, NOT
+#                                     prerelease. GitHub's own "Latest" flag
+#                                     always lands on the newest one of
+#                                     these — this is the "CHECK LATEST"
+#                                     channel in the Update Maestro feature.
+#   vX.Y.Z   (three numeric parts) -> tagged as a GitHub prerelease. Never
+#                                     eligible for the "Latest" flag no
+#                                     matter how recent — this is the
+#                                     "CHECK PRE-RELEASE" channel.
+# The "prerelease" flag below is computed automatically from the tag name
+# itself, so cutting a release never requires a manual `gh release edit`
+# afterwards to fix the flag.
 #
-# Tagging convention: vMAJOR.MINOR (matches the version badge in ui.html, e.g. "v2.1").
+# This is the "Latest" / "Pre-release" channel pair for the in-app "Update
+# Maestro" feature:
+#   UPDATE LATEST      pulls the newest tag NOT flagged prerelease (vX.Y)
+#   UPDATE PRE-RELEASE pulls the newest tag flagged prerelease (vX.Y.Z)
+#
+# Tagging convention:
+#   git tag vX.Y      (e.g. v2.3)   for a feature/behavioral release → Latest
+#   git tag vX.Y.Z    (e.g. v2.3.1) for a bugfix on an already-tagged
+#                                   version → Pre-release
 #
 # To cut a new release:
-#   git tag vX.Y
-#   git push origin vX.Y
+#   git tag vX.Y[.Z]
+#   git push origin vX.Y[.Z]
 #
 # No secrets to configure — uses the built-in GITHUB_TOKEN (contents: write below
 # grants it permission to create releases in this repo only).
@@ -30,7 +50,25 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
+      - name: Determine prerelease flag from tag pattern
+        id: vercheck
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          # Count numeric dot-separated components after the leading 'v'.
+          # vX.Y (2 components) -> Latest (prerelease=false)
+          # vX.Y.Z (3 components) -> Pre-release (prerelease=true)
+          VER="${TAG#v}"
+          PARTS=$(echo "$VER" | awk -F. '{print NF}')
+          if [ "$PARTS" -ge 3 ]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "Tag ${TAG} has ${PARTS} version components -> Pre-release"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "Tag ${TAG} has ${PARTS} version components -> Latest"
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          prerelease: ${{ steps.vercheck.outputs.prerelease }}
