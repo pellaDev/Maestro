@@ -7,6 +7,17 @@
 const tabIframes     = {};          // webuid -> iframe element
 const _suspendedTabs = new Set();   // webuid of suspended tabs
 
+// ── HTML escaping (Fix #5 — stored XSS via unescaped innerHTML) ───────────────
+// Every url interpolated into an innerHTML template below is attacker-settable
+// via the unauthenticated /api/add or /api/update-entry endpoints, so it must
+// never be inserted raw. Always route through _esc() before using ${...}
+// inside an innerHTML template literal.
+function _esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
 // ── Create container (iframe starts blank) ────────────────────────────────────
 function createWebContainer(uid, url, tv) {
   const cont = document.createElement('div');
@@ -24,7 +35,7 @@ function createWebContainer(uid, url, tv) {
   ph.innerHTML = `
     <img src="/img/MaestroLogo.svg" style="width:80px;height:80px;opacity:.06;pointer-events:none">
     <div style="color:var(--txt3);font-size:11px">
-      Connecting to <span style="color:var(--acc4)">${url}</span>…
+      Connecting to <span style="color:var(--acc4)">${_esc(url)}</span>…
     </div>`;
   cont.appendChild(ph);
 
@@ -53,7 +64,7 @@ function loadWebTab(uid, url) {
   if (!iframe || _suspendedTabs.has(uid)) return;
   const ph = document.getElementById('ph-' + uid);
   if (ph) { ph.style.display = 'flex'; ph.querySelector('div').innerHTML =
-    `Connecting to <span style="color:var(--acc4)">${url}</span>…`; }
+    `Connecting to <span style="color:var(--acc4)">${_esc(url)}</span>…`; }
   iframe.style.opacity = '0'; iframe.style.transition = '';
   iframe.dataset.origUrl = url;
   iframe.src = url;
@@ -68,7 +79,7 @@ function reloadWebTab(uid) {
     ph.innerHTML = `
       <img src="/img/MaestroLogo.svg" style="width:80px;height:80px;opacity:.06;pointer-events:none">
       <div style="color:var(--txt3);font-size:11px">
-        Reconnecting to <span style="color:var(--acc4)">${url}</span>…
+        Reconnecting to <span style="color:var(--acc4)">${_esc(url)}</span>…
       </div>`;
     ph.style.display = 'flex';
   }
@@ -110,7 +121,7 @@ function _suspendTab(uid, url) {
     ov.innerHTML = `
       <img src="/img/MaestroLogo.svg" style="width:70px;height:70px;opacity:.07;pointer-events:none">
       <div style="color:var(--txt3);font-size:11px">
-        ⏸ Suspended — <span style="color:var(--acc4)">${url}</span>
+        ⏸ Suspended — <span style="color:var(--acc4)">${_esc(url)}</span>
       </div>`;
     const btn = document.createElement('button');
     btn.textContent = '▶ Resume';

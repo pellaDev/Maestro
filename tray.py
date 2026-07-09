@@ -31,6 +31,15 @@ from urllib.error import URLError
 # ── Platform detection ─────────────────────────────────────────────────────────
 _WIN = sys.platform == 'win32'
 
+# ── Security: internal-call marker header (Fix #1) ─────────────────────────────
+# main.py's _origin_ok() trusts this header for tray.py's own urllib calls,
+# since urllib is not a browser and never sends Origin/Referer at all. Safe
+# specifically because main.py's _cors() never sends an Access-Control-Allow-
+# Origin header back, so no real cross-origin browser fetch could attach a
+# custom header here (its preflight would be refused before ever reaching
+# main.py).
+_INTERNAL_HEADERS = {"Content-Type": "application/json", "X-Maestro-Internal": "1"}
+
 # ── Windows: imports, constants, ctypes structures, GDI icon helper ────────────
 if _WIN:
     import ctypes, ctypes.wintypes, winreg
@@ -297,6 +306,9 @@ def _write_settings(s: dict):
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     try:
         fd, tmp = tempfile.mkstemp(dir=str(DATA_DIR), suffix=".json", text=True)
+        if not _WIN:
+            try: os.chmod(tmp, 0o600)
+            except OSError: pass
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(s, f, indent=2)
             f.write("\n")
@@ -375,7 +387,7 @@ def _remove_autostart():
         _remove_autostart_win()
     else:
         try:    AUTOSTART_DESKTOP.unlink(missing_ok=True)
-        except: pass
+        except Exception: pass
 
 
 def _write_autostart_win():
@@ -765,7 +777,7 @@ class MaestroTray:
             import urllib.request
             req = urllib.request.Request(
                 f"{url}/api/shutdown", data=b"{}",
-                headers={"Content-Type": "application/json"}, method="POST",
+                headers=_INTERNAL_HEADERS, method="POST",
             )
             urllib.request.urlopen(req, timeout=3)
         except Exception:
@@ -797,7 +809,7 @@ class MaestroTray:
             import urllib.request
             req = urllib.request.Request(
                 f"{url}/api/shutdown", data=b"{}",
-                headers={"Content-Type": "application/json"}, method="POST",
+                headers=_INTERNAL_HEADERS, method="POST",
             )
             urllib.request.urlopen(req, timeout=3)
         except Exception:
@@ -824,7 +836,7 @@ class MaestroTray:
             import urllib.request as _ur
             _ur.urlopen(_ur.Request(
                 f"{url}/api/shutdown", data=b"{}",
-                headers={"Content-Type": "application/json"}, method="POST",
+                headers=_INTERNAL_HEADERS, method="POST",
             ), timeout=2)
             time.sleep(0.8)
         except Exception:
@@ -848,12 +860,12 @@ class MaestroTray:
         if not proc or proc.poll() is not None:
             return
         try:    proc.terminate()
-        except: pass
+        except Exception: pass
         def _force():
             time.sleep(3.0)
             if proc.poll() is None:
                 try:    proc.kill()
-                except: pass
+                except Exception: pass
         threading.Thread(target=_force, daemon=True).start()
 
     def _watch_main(self):
@@ -974,7 +986,8 @@ class MaestroTray:
                 time.sleep(5)
                 continue
             try:
-                with urllib.request.urlopen(f"{url}/api/state", timeout=3) as resp:
+                req = urllib.request.Request(f"{url}/api/state", headers=_INTERNAL_HEADERS)
+                with urllib.request.urlopen(req, timeout=3) as resp:
                     resp.read()
                 if self._state != self.STATE_UP:
                     self._update_icon(self.STATE_UP)
@@ -1002,7 +1015,7 @@ class MaestroTray:
                 time.sleep(5)
                 continue
             try:
-                req = urllib.request.Request(f"{url}/api/logs/__maestro__")
+                req = urllib.request.Request(f"{url}/api/logs/__maestro__", headers=_INTERNAL_HEADERS)
                 with urllib.request.urlopen(req, timeout=None) as resp:
                     buf = b""
                     while True:

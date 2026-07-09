@@ -44,9 +44,12 @@ LOG_MAX_B    = 5_242_880
 LOG_KEEP     = 2
 CRASH_WAIT   = 3.0
 VALID_COLORS = {"default", "navy", "forest", "plum", "teal", "ember"}
+_MAX_SSE     = 64   # Fix #11: cap on concurrent SSE subscribers
+_sse_count       = 0
+_sse_count_lock  = threading.Lock()
 
 try:    CLK_TCK = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
-except: CLK_TCK = 100
+except (KeyError, ValueError, OSError, AttributeError): CLK_TCK = 100
 _NUM_CPUS = max(1, os.cpu_count() or 1)
 
 _ANSI = re.compile(r"\x1b(?:\[[0-9;]*[mGKHFA-Za-z]|\][^\x07]*\x07|[()][AB012])")
@@ -143,7 +146,14 @@ def _write_log(name: str, line: str):
     try:
         ts = time.strftime("%H:%M:%S")
         if GLOBAL_LOG.exists() and GLOBAL_LOG.stat().st_size >= LOG_MAX_B:
-            for i in range(LOG_KEEP, 0, -1):
+            # Fix #19: rotate correctly for LOG_KEEP files — drop the oldest
+            # (maestro.<LOG_KEEP>.log) before shifting, so exactly LOG_KEEP
+            # rotated files are ever kept (previously kept LOG_KEEP+1).
+            oldest = LOG_DIR / f"maestro.{LOG_KEEP}.log"
+            if oldest.exists():
+                try: oldest.unlink()
+                except OSError: pass
+            for i in range(LOG_KEEP - 1, 0, -1):
                 src = LOG_DIR / f"maestro.{i}.log"
                 dst = LOG_DIR / f"maestro.{i + 1}.log"
                 if src.exists():
@@ -165,7 +175,7 @@ def _mlog(msg: str):
         dead = []
         for q in _self_subs:
             try:    q.put_nowait(("log", line))
-            except: dead.append(q)
+            except queue.Full: dead.append(q)
         for q in dead:
             _self_subs.remove(q)
 
@@ -195,6 +205,19 @@ def toggle_logging() -> bool:
     _logging_enabled = not _logging_enabled
     _mlog(f"File logging {'enabled' if _logging_enabled else 'disabled'}")
     return _logging_enabled
+
+
+# ── Config field escaping (Fix #8) ─────────────────────────────────────────────
+# config.txt is pipe-delimited with no quoting; a literal "|" or newline inside
+# a path/name field silently corrupts every field after it on load. Percent-
+# encoding is round-trip safe and backward compatible: old files with no
+# percent-sequences decode completely unchanged.
+def _enc(s: str) -> str:
+    return str(s).replace("%", "%25").replace("|", "%7C").replace("\n", "%0A")
+
+
+def _dec(s: str) -> str:
+    return s.replace("%0A", "\n").replace("%7C", "|").replace("%25", "%")
 
 
 # ── ProcessEntry ───────────────────────────────────────────────────────────────
@@ -305,7 +328,7 @@ def _pid_alive(pid: int) -> bool:
 # ── Config I/O ─────────────────────────────────────────────────────────────────
 def _int(s, d: int = 0) -> int:
     try:    return max(0, int(str(s).strip()))
-    except: return d
+    except Exception: return d
 
 
 def _parse_webapps(raw: str) -> list:
@@ -331,17 +354,17 @@ def load_config():
             continue
         p     = line.split("|", 14)
         st    = p[0].strip()
-        path  = p[1].strip()  if len(p) > 1  else ""
+        path  = _dec(p[1].strip())  if len(p) > 1  else ""
         pid_s = p[2].strip()  if len(p) > 2  else ""
         delay = _int(p[3])    if len(p) > 3  else 0
         ar    = (_int(p[4]) != 0) if len(p) > 4  else False
         ko    = (_int(p[5]) != 0) if len(p) > 5  else True
-        name  = p[6].strip()  if len(p) > 6  else ""
+        name  = _dec(p[6].strip())  if len(p) > 6  else ""
         lh    = (_int(p[8]) != 0) if len(p) > 8  else False
         wb    = _parse_webapps(p[9].strip()  if len(p) > 9  else "")
-        us    = p[10].strip() if len(p) > 10 else ""
-        sf    = p[11].strip() if len(p) > 11 else ""
-        inf   = p[12].strip() if len(p) > 12 else ""
+        us    = _dec(p[10].strip()) if len(p) > 10 else ""
+        sf    = _dec(p[11].strip()) if len(p) > 11 else ""
+        inf   = _dec(p[12].strip()) if len(p) > 12 else ""
         oo    = (_int(p[13]) != 0) if len(p) > 13 else False
         tc    = p[14].strip() if len(p) > 14 else "default"
         if st == "SEP":
@@ -373,8 +396,8 @@ def save_config():
                 ps = str(e.pid) if e.pid is not None else ""
                 if e.status == "SEP":
                     f.write(
-                        f"SEP|{e.path}|||0|1|{e.name}|0|0|[]"
-                        f"||{e.sep_file}|{e.info_file}|0|default\n"
+                        f"SEP|{_enc(e.path)}|||0|1|{_enc(e.name)}|0|0|[]"
+                        f"||{_enc(e.sep_file)}|{_enc(e.info_file)}|0|default\n"
                     )
                 else:
                     ar = 1 if e.auto_restart  else 0
@@ -384,9 +407,9 @@ def save_config():
                     wb = json.dumps(e.webapps, separators=(',', ':'))
                     tc = e.term_color if e.term_color in VALID_COLORS else "default"
                     f.write(
-                        f"{e.status}|{e.path}|{ps}|{e.delay}|{ar}|{ko}"
-                        f"|{e.name}|0|{lh}|{wb}|{e.update_script}"
-                        f"|{e.sep_file}|{e.info_file}|{oo}|{tc}\n"
+                        f"{e.status}|{_enc(e.path)}|{ps}|{e.delay}|{ar}|{ko}"
+                        f"|{_enc(e.name)}|0|{lh}|{wb}|{_enc(e.update_script)}"
+                        f"|{_enc(e.sep_file)}|{_enc(e.info_file)}|{oo}|{tc}\n"
                     )
         shutil.move(tmp, str(CONFIG_FILE))
     except Exception as ex:
@@ -402,7 +425,7 @@ def _append_log(e, line: str):
         dead = []
         for q in e.subs:
             try:    q.put_nowait(("log", line))
-            except: dead.append(q)
+            except queue.Full: dead.append(q)
         for q in dead:
             e.subs.remove(q)
     _write_log(e.display_name(), line)
@@ -413,7 +436,7 @@ def _pub(e, event: str, data: str):
     with e.subs_lock:
         for q in e.subs:
             try: q.put_nowait((event, data))
-            except: pass
+            except queue.Full: pass
 
 
 def _close_subs(e):
@@ -421,7 +444,7 @@ def _close_subs(e):
     with e.subs_lock:
         for q in e.subs:
             try: q.put_nowait(None)
-            except: pass
+            except queue.Full: pass
 
 
 # ── Metrics ────────────────────────────────────────────────────────────────────
@@ -503,8 +526,11 @@ def _update_metrics_win(e):
 
         e.metrics = {"cpu": round(raw, 1), "ram": ram_mb}
     except Exception:
-        e.metrics   = {"cpu": 0.0, "ram": 0}
-        e._cpu_prev = None
+        e.metrics = {"cpu": 0.0, "ram": 0}
+        # Fix #17: leave e._cpu_prev intact on a transient exception so CPU%
+        # can resume on the next good sample, instead of resetting the whole
+        # delta baseline (which previously caused a full extra sample of 0%
+        # after any momentary blip, not just a PID-gone condition).
     finally:
         ctypes.windll.kernel32.CloseHandle(h)
 
@@ -715,14 +741,14 @@ def _kill_ext(e):
             time.sleep(2.0)
             if proc.poll() is None:
                 try:    proc.kill()
-                except: pass
+                except Exception: pass
         threading.Thread(target=_force, daemon=True).start()
     else:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         except (ProcessLookupError, PermissionError, OSError):
             try:    proc.terminate()
-            except: pass
+            except Exception: pass
 
         def _force():
             time.sleep(2.0)
@@ -845,7 +871,7 @@ def _kill_proc(e):
             os.killpg(os.getpgid(e.proc.pid), signal.SIGTERM)
         except (ProcessLookupError, PermissionError, OSError):
             try:    e.proc.terminate()
-            except: pass
+            except Exception: pass
 
 
 def launch(idx: int, *, _from_restart: bool = False):
@@ -955,8 +981,14 @@ def _launch_external(e, gen: int):
 
 def _reader(e, gen: int):
     """Read stdout/stderr from the internal subprocess and push lines to SSE."""
+    # Fix #14: snapshot e.proc under the lock rather than reading the
+    # attribute directly from a background thread with no synchronization.
+    with _lock:
+        proc = e.proc
+    if proc is None:
+        return
     try:
-        for line in e.proc.stdout:
+        for line in proc.stdout:
             if e.generation != gen:
                 break
             _append_log(e, line.rstrip("\n"))
@@ -966,11 +998,15 @@ def _reader(e, gen: int):
 
 def _monitor(e, gen: int):
     """Wait for the internal subprocess to exit. Handles crash, close_panel, auto-restart."""
-    try:    e.proc.wait()
-    except: pass
+    with _lock:
+        proc = e.proc
+    if proc is None:
+        return
+    try:    proc.wait()
+    except Exception: pass
     if e.generation != gen:
         return
-    rc = e.proc.returncode
+    rc = proc.returncode
     with _lock:
         e.pid   = None
         e.crash = False
@@ -1002,7 +1038,7 @@ def _monitor_external(e, proc, gen: int):
     Updates e.pid and fires SSE events so the UI stays in sync.
     """
     try:    proc.wait()
-    except: pass
+    except Exception: pass
     if e.generation != gen:
         return
     with _lock:
@@ -1023,7 +1059,7 @@ def _monitor_external(e, proc, gen: int):
 def _monitor_update_ext(e, proc):
     """Wait for an update script terminal to exit and log the result."""
     try:    proc.wait()
-    except: pass
+    except Exception: pass
     if e.ext_proc is proc:
         e.ext_proc = None
     rc = proc.returncode if proc.returncode is not None else "?"
@@ -1042,6 +1078,13 @@ def kill_entry(idx: int):
         _kill_ext(e)
         # For open_outside scripts, also kill the script PID directly —
         # the terminal emulator may not propagate the signal to the child.
+        # NOTE (Fix #12, documented limitation): for several terminal
+        # emulators (notably gnome-terminal), e.pid is the terminal's PID,
+        # not necessarily the script's — some emulators fork into a
+        # pre-existing server process and return immediately, so this kill
+        # can target a dead or unrelated PID while the real script keeps
+        # running. No clean fix exists across all six supported emulators
+        # without materially more complexity; this is a best-effort kill.
         if e.open_outside and e.pid is not None:
             if _WIN:
                 try:
@@ -1058,7 +1101,7 @@ def kill_entry(idx: int):
                     os.killpg(os.getpgid(e.pid), signal.SIGTERM)
                 except (ProcessLookupError, PermissionError, OSError):
                     try:    os.kill(e.pid, signal.SIGTERM)
-                    except: pass
+                    except Exception: pass
         e.pid   = None
         e.crash = False
         save_config()

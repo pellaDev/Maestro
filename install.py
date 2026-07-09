@@ -285,6 +285,16 @@ if not settings_file.exists():
         json.dumps(default_settings, indent=2) + '\n',
         encoding='utf-8',
     )
+    # Fix #13: settings.json can later hold a GitHub PAT (githubToken) —
+    # restrict permissions from the very first install, not just on later
+    # writes from main.py/tray.py. No POSIX chmod bits on Windows itself,
+    # but this installer can also target a WSL/POSIX-style path, so guard
+    # with a platform check rather than assuming.
+    if platform.system() != "Windows":
+        try:
+            os.chmod(settings_file, 0o600)
+        except OSError:
+            pass
     ok(f"Created {settings_file}")
 else:
     info("settings.json already exists — not overwritten")

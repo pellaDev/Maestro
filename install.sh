@@ -323,7 +323,12 @@ if [[ ! -f "$SETTINGS_FILE" ]]; then
   "dataDir": ""
 }
 EOF
-  ok "Created ${SETTINGS_FILE}"
+  # Fix #13: settings.json can later hold a GitHub PAT (githubToken) — make
+  # it non-world-readable from the very first install, not just on later
+  # writes from main.py/tray.py, so a shared-machine account never has a
+  # window where it's readable.
+  chmod 600 "$SETTINGS_FILE"
+  ok "Created ${SETTINGS_FILE} (mode 600)"
 else
   info "settings.json already exists — not overwritten"
 fi

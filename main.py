@@ -21,7 +21,33 @@ from urllib.parse import parse_qs, urlparse, quote
 
 import daemon
 
+# ── Security: internal-call marker header (see Fix #1) ────────────────────────
+# tray.py's own urllib-based calls into main.py's API set this header so
+# _origin_ok() can trust them even though they carry no Origin/Referer (they
+# aren't a browser). Safe specifically because no Access-Control-Allow-Origin
+# header is ever sent back (see Handler._cors) — a real cross-origin browser
+# fetch attempting to attach a custom header triggers a CORS preflight, which
+# is refused with no ACAO header present, so the real request never sends.
+_INTERNAL_HEADER = "X-Maestro-Internal"
+
+# ── Security: settings mutation lock (Fix #15) ─────────────────────────────────
+_settings_lock = threading.Lock()
+
+# ── Security: single-update-at-a-time lock (Fix #20) ───────────────────────────
+_update_lock = threading.Lock()
+
+# ── Security: sensitive filenames never served via /api/read-file (Fix #4) ────
+_SENSITIVE_NAMES = {
+    '.netrc', '.npmrc', '.pgpass', '.bash_history', '.zsh_history',
+    '.python_history', '.git-credentials', 'known_hosts', 'authorized_keys',
+    'shadow', 'passwd',
+}
+
+# ── Security: allow-listed external file-manager openers (Fix #3) ─────────────
+_ALLOWED_OPENERS = {"thunar", "nautilus", "dolphin", "pcmanfm", "nemo", "xdg-open"}
+
 # ── Paths ──────────────────────────────────────────────────────────────────────
+
 BASE_DIR = Path(__file__).parent      # bin/ — source files, img/, ui assets
 PID_FILE = Path(tempfile.gettempdir()) / "MaestroWeb.pid"
 
@@ -45,34 +71,11 @@ _TEXT_EXTS = {
 }
 
 # ── Update Maestro (Settings modal "Update Latest" / "Update Pre-release") ────
-# See MAESTRO_GUIDE.md → "Update Maestro" feature section for the full design
-# rationale. Summary: main.py only downloads + validates + stages the new
-# files into a clean temp directory — it never touches bin/ itself. The
-# actual bin/ swap and full-stack restart (including tray.py re-exec, since
-# tray.py's own file may have changed) is handled by tray.py, triggered via
-# a marker file in DATA_DIR that tray.py checks after main.py exits.
-#
-# Channel naming: aligned to GitHub's own vocabulary, not an arbitrary
-# Maestro-only scheme — GitHub itself flags the newest non-prerelease tagged
-# Release as "Latest" and anything else as "Pre-release". So:
-#   channel="release" -> the latest tagged GitHub Release   -> UI label "Latest"
-#   channel="main"    -> the main branch HEAD (bleeding edge) -> UI label "Pre-release"
-# These internal values are deliberately NOT called "stable"/"latest"
-# themselves — using an adjective as the internal identifier while a
-# DIFFERENT UI label describing the same channel also exists (e.g. internal
-# "latest" meaning main-branch while the UI says "Pre-release" for it) is
-# exactly the kind of self-contradicting naming this rename was meant to
-# eliminate. "release"/"main" describe what the channel actually IS, not an
-# adjective about its quality — the UI label does that job instead.
 _GITHUB_REPO         = "AIdevelopmentPit/Maestro"
 _GITHUB_RELEASES_API = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
 _GITHUB_MAIN_ZIP_API = f"https://api.github.com/repos/{_GITHUB_REPO}/zipball/main"
 _UPDATE_MARKER_NAME  = "update_request.json"
 
-# Runtime files copied from the downloaded zip into the clean staging dir —
-# intentionally mirrors install.sh / install.py's SRC_FILES so an update
-# never pulls repo-only files (README.md, install.sh, .github/, etc.) into
-# a live bin/.
 _UPDATE_SRC_FILES = [
     "tray.py", "main.py", "daemon.py",
     "ui.html", "ui.js", "webui.js",
@@ -85,16 +88,6 @@ _UPDATE_SRC_IMG_FILES = [
 
 
 class _NoRedirectHandler(urllib.request.HTTPErrorProcessor):
-    """
-    Passes 30x responses straight through instead of following them.
-    Needed because GitHub's zipball API redirects (api.github.com →
-    codeload.github.com / objects.githubusercontent.com) to a pre-signed,
-    unauthenticated URL — and urllib's default redirect handling silently
-    drops the Authorization header on any cross-host redirect. Letting the
-    redirect through lets us grab the Location header ourselves and fetch
-    the actual bytes with NO auth header, which is what the signed URL
-    expects anyway.
-    """
     def http_response(self, request, response):
         return response
     https_response = http_response
@@ -114,12 +107,6 @@ def _github_api_get_json(url: str, token: str) -> dict:
 
 
 def _github_download_zip(url: str, token: str, dest_path: str):
-    """
-    Download a GitHub zipball URL to dest_path, manually following at most
-    one redirect without carrying the Authorization header across it —
-    see _NoRedirectHandler docstring for why this can't just be a plain
-    urlopen() call when a token is involved.
-    """
     opener = urllib.request.build_opener(_NoRedirectHandler)
     req = urllib.request.Request(url, headers=_github_auth_headers(token))
     resp = opener.open(req, timeout=30)
@@ -128,6 +115,11 @@ def _github_download_zip(url: str, token: str, dest_path: str):
             location = resp.headers.get("Location")
             if not location:
                 raise RuntimeError(f"GitHub redirect ({resp.status}) had no Location header")
+            # Fix #10: only follow redirects to hosts GitHub actually uses for
+            # zipball downloads — refuse anything else outright.
+            rhost = (urlparse(location).hostname or "")
+            if not (rhost == "codeload.github.com" or rhost.endswith(".githubusercontent.com")):
+                raise RuntimeError(f"Refusing to follow untrusted redirect to: {location}")
             with urllib.request.urlopen(location, timeout=60) as final_resp, open(dest_path, "wb") as f:
                 shutil.copyfileobj(final_resp, f)
         elif resp.status == 200:
@@ -140,11 +132,8 @@ def _github_download_zip(url: str, token: str, dest_path: str):
 
 
 def _resolve_update_zip_api_url(channel: str, token: str) -> str:
-    """Resolve the GitHub zipball API URL for the given update channel."""
     if channel == "main":
         return _GITHUB_MAIN_ZIP_API
-    # channel == "release": ask the GitHub API for the latest tagged Release's
-    # zipball URL (itself another api.github.com zipball endpoint — same auth handling).
     data = _github_api_get_json(_GITHUB_RELEASES_API, token)
     url = data.get("zipball_url", "")
     if not url:
@@ -153,21 +142,6 @@ def _resolve_update_zip_api_url(channel: str, token: str) -> str:
 
 
 def _stage_update(channel: str) -> Path:
-    """
-    Download the requested channel's source zip, extract it, validate it
-    contains the expected core files, and copy the known runtime file set
-    into a clean staging directory.
-
-    Uses the githubToken setting (if configured) for private-repo access —
-    see MAESTRO_GUIDE.md for why the token never leaves the server side
-    (main.py / settings.json only; never sent to the browser).
-
-    Never touches BASE_DIR/bin — safe to call before deciding to restart.
-    Returns the staging directory path on success.
-    Raises RuntimeError (or lets the underlying exception propagate) with a
-    human-readable message on any failure; the staging dir is cleaned up
-    before raising so no partial state is left behind.
-    """
     token = str(_settings.get("githubToken", "")).strip()
     url = _resolve_update_zip_api_url(channel, token)
 
@@ -180,21 +154,30 @@ def _stage_update(channel: str) -> Path:
         _github_download_zip(url, token, tmp_zip_path)
 
         with zipfile.ZipFile(tmp_zip_path) as zf:
+            # Fix #9: defense in depth for a very-high-blast-radius operation
+            # (the extracted content becomes the next bin/) — reject any
+            # member that would escape extract_dir, and reject symlink
+            # entries outright (a zip-slip check alone doesn't stop a member
+            # from *being* a symlink that then gets followed on copy).
+            extract_root = extract_dir.resolve()
+            for info in zf.infolist():
+                member_path = (extract_root / info.filename).resolve()
+                if not str(member_path).startswith(str(extract_root)):
+                    raise RuntimeError(f"Zip contains an unsafe path: {info.filename}")
+                if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                    raise RuntimeError(f"Zip contains a symlink, refusing: {info.filename}")
             zf.extractall(extract_dir)
 
-        # GitHub zips contain exactly one top-level folder (repo-branch or repo-sha)
         subdirs = [p for p in extract_dir.iterdir() if p.is_dir()]
         if len(subdirs) != 1:
             raise RuntimeError(f"Unexpected zip layout ({len(subdirs)} top-level folders)")
         repo_root = subdirs[0]
 
-        # Validate the core files exist before trusting this download at all
         required = ["tray.py", "main.py", "daemon.py", "ui.html", "ui.js", "webui.js"]
         missing = [f for f in required if not (repo_root / f).is_file()]
         if missing:
             raise RuntimeError(f"Downloaded archive is missing: {', '.join(missing)}")
 
-        # Copy only the known runtime file set into the clean staging dir
         (staging_dir / "img").mkdir(parents=True, exist_ok=True)
         for fname in _UPDATE_SRC_FILES:
             src = repo_root / fname
@@ -218,7 +201,6 @@ _VERSION_BADGE_RE = re.compile(r'class="ver">v([0-9][0-9A-Za-z.\-]*)')
 
 
 def _read_local_badge_version() -> str:
-    """Read the currently-running ui.html's version badge straight off disk."""
     try:
         html = UI_FILE.read_text(encoding="utf-8", errors="replace")
         m = _VERSION_BADGE_RE.search(html)
@@ -228,11 +210,6 @@ def _read_local_badge_version() -> str:
 
 
 def _fetch_remote_badge_version(ref: str, token: str) -> str:
-    """
-    Fetch just ui.html's version badge at the given git ref (branch or tag)
-    via the GitHub Contents API — a single small authenticated call, no need
-    to download a whole zip just to check a version number.
-    """
     url = f"https://api.github.com/repos/{_GITHUB_REPO}/contents/ui.html?ref={quote(ref)}"
     data = _github_api_get_json(url, token)
     content_b64 = data.get("content", "")
@@ -258,31 +235,20 @@ _DEFAULT_SETTINGS: dict = {
     "githubToken":         "",
 }
 
-# Populated by _load_settings() in main() — do not access before that point.
 _settings:  dict = {}
-_DATA_DIR:  Path = None  # set in main() before daemon.init()
+_DATA_DIR:  Path = None
 
 
 def _resolve_data_dir() -> Path:
-    """
-    Resolve data directory using priority order:
-      1. --data-dir CLI argument  (tray.py passes this)
-      2. MAESTRO_DATA environment variable
-      3. dataDir field in settings.json at the default location
-      4. Default: BASE_DIR.parent / "data"
-    """
-    # Priority 1: CLI arg from tray.py
     args = sys.argv[1:]
     for i, arg in enumerate(args):
         if arg == "--data-dir" and i + 1 < len(args):
             return Path(args[i + 1]).resolve()
 
-    # Priority 2: environment variable
     env = os.environ.get("MAESTRO_DATA", "").strip()
     if env:
         return Path(env).resolve()
 
-    # Priority 3: dataDir stored in settings.json at the default location
     default       = (BASE_DIR.parent / "data").resolve()
     settings_probe = default / "settings.json"
     if settings_probe.exists():
@@ -293,37 +259,34 @@ def _resolve_data_dir() -> Path:
         except Exception:
             pass
 
-    # Priority 4: default
     return default
 
 
 def _load_settings(data_dir: Path) -> dict:
-    """
-    Read settings.json from data_dir.
-    Creates it with _DEFAULT_SETTINGS on the first run.
-    Any missing key is backfilled from defaults (forward-compat).
-    """
     path = data_dir / "settings.json"
     s    = dict(_DEFAULT_SETTINGS)
     if path.exists():
         try:
             on_disk = json.loads(path.read_text())
-            # Only accept known keys; ignore stale/unknown ones
             s.update({k: v for k, v in on_disk.items() if k in _DEFAULT_SETTINGS})
         except Exception:
             pass
     else:
-        # First run — persist defaults so tray.py and the user can inspect them
         _write_settings(data_dir, s)
     return s
 
 
 def _write_settings(data_dir: Path, s: dict):
-    """Atomic write of settings dict to data_dir/settings.json."""
     path = data_dir / "settings.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         fd, tmp = tempfile.mkstemp(dir=str(data_dir), suffix=".json", text=True)
+        # Fix #13: settings.json holds the GitHub token — make the restrictive
+        # mode explicit rather than incidental, so it's correct regardless of
+        # umask. Windows has no POSIX chmod bits; skip there.
+        if not sys.platform.startswith("win"):
+            try: os.chmod(tmp, 0o600)
+            except OSError: pass
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(s, f, indent=2)
             f.write("\n")
@@ -337,13 +300,29 @@ _server = None
 
 
 # ── Single instance ────────────────────────────────────────────────────────────
+def _is_maestro_process(pid: int) -> bool:
+    """
+    Fix #16: verify a live PID actually belongs to a Maestro main.py process
+    before trusting it — otherwise a stale PID from an unclean shutdown that
+    got recycled by an unrelated OS process would make Maestro wrongly refuse
+    to start. Linux-only check (via /proc); on Windows or if /proc is
+    unavailable, fall back to the old trust-any-live-PID behavior.
+    """
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+        return b"main.py" in cmdline
+    except Exception:
+        return True  # can't verify — keep previous (safe-by-default) behavior
+
+
 def _check_single() -> bool:
     if PID_FILE.exists():
         try:
             ex = int(PID_FILE.read_text().strip())
             os.kill(ex, 0)
-            print(f"[maestro] already running (PID {ex})", file=sys.stderr)
-            return False
+            if _is_maestro_process(ex):
+                print(f"[maestro] already running (PID {ex})", file=sys.stderr)
+                return False
         except (ValueError, ProcessLookupError, PermissionError):
             pass
     PID_FILE.write_text(str(os.getpid()))
@@ -357,6 +336,17 @@ def _cleanup():
         pass
 
 
+# ── Security helper: safe integer index parsing (Fix #7) ───────────────────────
+def _as_index(v):
+    """Parse a request-supplied index safely — never raises, never accepts bool."""
+    if isinstance(v, bool):
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 # ── HTTP Handler ───────────────────────────────────────────────────────────────
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass   # suppress access log
@@ -364,6 +354,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # ── Routing ────────────────────────────────────────────────────────────────
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/")
+        # Origin/Referer check only applies to data-bearing /api/* routes.
+        # Static assets (/, /ui.js, /webui.js, /img/*) MUST stay exempt: a
+        # direct browser navigation or hard refresh sends no Origin header
+        # and often no Referer either, so gating those would make the UI
+        # itself unloadable. They carry no secrets and are pure read-only
+        # shell/asset files, so this exemption doesn't reopen Fix #1 — the
+        # sensitive surface (settings, file contents, process control) is
+        # entirely under /api/*, and stays protected below.
+        if path.startswith("/api/") and not self._origin_ok():
+            self._err(403, "cross-origin request denied")
+            return
         if path in ("", "/"):
             self._serve_file(UI_FILE, "text/html")
         elif path == "/ui.js":
@@ -379,7 +380,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/read-file":
             self._read_file()
         elif path == "/api/settings":
-            self._json(_settings)
+            # Fix #2: never return the real token to the browser — a full
+            # unauthenticated GET must not leak it. Signal presence instead.
+            safe = dict(_settings)
+            if safe.get("githubToken"):
+                safe["githubToken"]    = ""
+                safe["githubTokenSet"] = True
+            else:
+                safe["githubTokenSet"] = False
+            self._json(safe)
         elif path == "/api/update-check":
             self._api_update_check()
         elif path.startswith("/img/"):
@@ -390,6 +399,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._err(404, "Not found")
 
     def do_POST(self):
+        if not self._origin_ok():
+            self._err(403, "cross-origin request denied")
+            return
         body  = self._body()
         route = self.path.rstrip("/")
         fn = {
@@ -423,16 +435,56 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # ── Low-level helpers ──────────────────────────────────────────────────────
     def _cors(self):
-        self.send_header("Access-Control-Allow-Origin",  "*")
+        # Intentionally NO Access-Control-Allow-Origin header at all: this API
+        # has no auth, so any cross-origin readability is a full data/credential
+        # takeover risk (see MAESTRO_AUDIT_FINAL.md Fix #1). ui.js only ever
+        # makes same-origin relative-path fetches and never needs this header.
+        # Do not add it back, even conditionally on Origin — that single header
+        # is the entire vulnerability. _origin_ok() below is a second,
+        # independent layer against blind (non-reading) cross-origin POSTs,
+        # which CORS headers never protected against anyway.
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type,X-Maestro-Internal")
+
+    def _origin_ok(self) -> bool:
+        """
+        Reject cross-origin state-changing/reading requests (Fix #1). A real
+        browser attaches Origin (or at least Referer) on both same- and
+        cross-origin requests in modern browsers; Maestro's own tray.py calls
+        (urllib, not a browser) carry no Origin at all but set _INTERNAL_HEADER
+        instead — trustworthy specifically because _cors() never sends back an
+        Access-Control-Allow-Origin header, so a real cross-origin browser
+        fetch can never successfully attach a custom header here (its
+        preflight would be refused).
+        """
+        if self.headers.get(_INTERNAL_HEADER) == "1":
+            return True
+        raw = self.headers.get("Origin") or self.headers.get("Referer")
+        if not raw:
+            return False  # no Origin/Referer and no internal marker — reject
+        u = urlparse(raw)
+        host = u.hostname or ""
+        port = u.port or (443 if u.scheme == "https" else 80)
+        exp_host = str(_settings.get("host", "127.0.0.1"))
+        exp_port = int(_settings.get("port", 8865))
+        return host in (exp_host, "127.0.0.1", "localhost", "::1") and port == exp_port
+
+    _MAX_BODY = 16 * 1024 * 1024  # 16 MB ceiling (Fix #18)
 
     def _body(self) -> dict:
-        cl = int(self.headers.get("Content-Length", 0))
-        if cl:
-            try:    return json.loads(self.rfile.read(cl))
-            except: return {}
-        return {}
+        try:
+            cl = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            return {}
+        if cl <= 0:
+            return {}
+        if cl > self._MAX_BODY:
+            self._err(413, "payload too large")
+            return {}
+        try:
+            return json.loads(self.rfile.read(cl))
+        except Exception:
+            return {}
 
     def _json(self, data, code: int = 200):
         raw = json.dumps(data).encode()
@@ -504,6 +556,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
 
+        # Fix #11: cap concurrent SSE subscribers — ThreadingHTTPServer spawns
+        # one thread per connection and each SSE stream blocks its thread
+        # indefinitely, so with no cap a pile of idle streams (local multi-tab
+        # or LAN access) can pin the whole thread pool.
+        with daemon._sse_count_lock:
+            if daemon._sse_count >= daemon._MAX_SSE:
+                self.send_response(503)
+                self._cors()
+                self.end_headers()
+                return
+            daemon._sse_count += 1
+
         q = queue.Queue(maxsize=500)
         with lock:
             buf = list(buf_deque)
@@ -529,6 +593,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         finally:
+            with daemon._sse_count_lock:
+                daemon._sse_count -= 1
             with lock:
                 try:    subs_list.remove(q)
                 except ValueError: pass
@@ -571,6 +637,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not p.is_file():
             self._json({"error": "not a file"})
             return
+        if p.name.lower() in _SENSITIVE_NAMES or p.name.lower().startswith(('id_rsa', 'id_ed25519')):
+            self._json({"error": "refusing to read a sensitive file"})
+            return
         if p.stat().st_size > 512 * 1024:
             self._json({"error": "file too large (>512KB)"})
             return
@@ -585,16 +654,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"error": "permission denied"})
 
     def _api_update_check(self):
-        """
-        GET /api/update-check?channel=release|main
-        Compares the locally-running ui.html's version badge against the
-        same badge at the channel's remote ref (latest Release tag for
-        "release", "main" HEAD for "main") — a single small authenticated
-        GitHub Contents API call, not a full zip download. Uses the
-        githubToken setting server-side, so this works against a private
-        repo (unlike a client-side fetch straight from the browser, which
-        can't carry the token without exposing it).
-        """
         qs = parse_qs(urlparse(self.path).query)
         channel = qs.get("channel", [""])[0]
         if channel not in ("release", "main"):
@@ -667,12 +726,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._json({"ok": True})
 
     def _toggle(self, b: dict):
-        idx = b.get("idx")
+        idx = _as_index(b.get("idx"))
         if idx is None:
-            self._err(400, "missing idx")
+            self._err(400, "idx must be an integer")
             return
         with daemon._lock:
-            if idx >= len(daemon.entries):
+            if not (0 <= idx < len(daemon.entries)):
                 self._err(404, "not found")
                 return
             e = daemon.entries[idx]
@@ -703,12 +762,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._json({"ok": True})
 
     def _remove(self, b: dict):
-        idx = b.get("idx")
+        idx = _as_index(b.get("idx"))
         if idx is None:
-            self._err(400, "missing idx")
+            self._err(400, "idx must be an integer")
             return
         with daemon._lock:
-            if idx >= len(daemon.entries):
+            if not (0 <= idx < len(daemon.entries)):
                 self._err(404, "not found")
                 return
             e = daemon.entries[idx]
@@ -722,12 +781,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._json({"ok": True})
 
     def _reorder(self, b: dict):
-        a, bv = b.get("a"), b.get("b")
+        a  = _as_index(b.get("a"))
+        bv = _as_index(b.get("b"))
         if a is None or bv is None:
-            self._err(400, "missing a/b")
+            self._err(400, "a/b must be integers")
             return
         with daemon._lock:
-            if max(a, bv) >= len(daemon.entries):
+            n = len(daemon.entries)
+            if not (0 <= a < n and 0 <= bv < n):
                 self._err(404, "out of range")
                 return
             daemon.entries[a], daemon.entries[bv] = daemon.entries[bv], daemon.entries[a]
@@ -736,21 +797,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _add_sep(self, b: dict):
         name  = (b.get("name") or "Separator").strip() or "Separator"
-        after = b.get("after", len(daemon.entries))
+        after = _as_index(b.get("after"))
+        if after is None:
+            after = len(daemon.entries)
         sf    = b.get("sepFile", "").strip()
         with daemon._lock:
-            pos = min(max(0, int(after) + 1), len(daemon.entries))
+            pos = min(max(0, after + 1), len(daemon.entries))
             daemon.entries.insert(pos, daemon.ProcessEntry("SEP", name, sep_file=sf))
             daemon.save_config()
         self._json({"ok": True})
 
     def _update_entry(self, b: dict):
-        idx = b.get("idx")
+        idx = _as_index(b.get("idx"))
         if idx is None:
-            self._err(400, "missing idx")
+            self._err(400, "idx must be an integer")
             return
         with daemon._lock:
-            if idx >= len(daemon.entries):
+            if not (0 <= idx < len(daemon.entries)):
                 self._err(404, "not found")
                 return
             e = daemon.entries[idx]
@@ -849,6 +912,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not app:
             self._err(400, "missing app")
             return
+        if app not in _ALLOWED_OPENERS:
+            self._json({"ok": False, "error": "opener not allowed"})
+            return
         try:
             cmd = [app]
             if path:
@@ -866,35 +932,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"ok": False, "error": str(ex)})
 
     def _toggle_logging(self, _b: dict):
-        """
-        Legacy endpoint — kept for UI backward compat during v1.4→v2.0 transition.
-        Delegates to daemon.toggle_logging() and syncs the result to settings.json.
-        The v2.0 settings modal will call POST /api/settings instead.
-        """
         new_state = daemon.toggle_logging()
         _settings["logsRecorder"] = new_state
         _write_settings(_DATA_DIR, _settings)
         self._json({"ok": True, "enabled": new_state})
 
     def _post_settings(self, b: dict):
-        """
-        Update one or more settings keys and persist to settings.json.
-        Applies immediate in-process side effects where relevant:
-          logsRecorder  → daemon._logging_enabled
-          autostart     → tray.py handles .desktop file (just persisted here)
-          dataDir       → migration handled by tray.py   (just persisted here)
-          host / port   → require restart to take effect  (just persisted here)
-        """
-        changed = False
-        for key, val in b.items():
-            if key not in _DEFAULT_SETTINGS:
-                continue
-            _settings[key] = val
-            changed = True
-            if key == "logsRecorder":
-                daemon._logging_enabled = bool(val)
-        if changed:
-            _write_settings(_DATA_DIR, _settings)
+        # Fix #6: reject a bad port/host before it ever reaches disk — an
+        # invalid value here would otherwise only surface as a crash on the
+        # *next* startup, requiring manual settings.json editing to recover.
+        if "port" in b:
+            try:
+                p = int(b["port"])
+                if not (1 <= p <= 65535):
+                    raise ValueError
+                b["port"] = p
+            except (TypeError, ValueError):
+                self._err(400, "port must be an integer 1-65535")
+                return
+        if "host" in b and not isinstance(b["host"], str):
+            self._err(400, "host must be a string")
+            return
+
+        # Fix #15: serialize settings mutation against concurrent saves.
+        with _settings_lock:
+            changed = False
+            for key, val in b.items():
+                if key not in _DEFAULT_SETTINGS:
+                    continue
+                _settings[key] = val
+                changed = True
+                if key == "logsRecorder":
+                    daemon._logging_enabled = bool(val)
+            if changed:
+                _write_settings(_DATA_DIR, _settings)
         self._json({"ok": True, "settings": _settings})
 
     def _shutdown(self, _b: dict):
@@ -910,73 +981,64 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with daemon._self_subs_lock:
                 for q in daemon._self_subs:
                     try: q.put_nowait(None)
-                    except: pass
+                    except Exception: pass
             if _server:
                 threading.Thread(target=_server.shutdown, daemon=True).start()
 
         threading.Thread(target=_do, daemon=True).start()
 
     def _update_maestro(self, b: dict):
-        """
-        Download + stage a Maestro update from the requested channel
-        ("release" = latest tagged Release, UI label "Latest";
-         "main" = main branch HEAD, UI label "Pre-release").
-
-        Responds only AFTER the download + extraction + validation have
-        all succeeded — a failure (bad network, GitHub rate limit,
-        malformed archive) is reported directly to the caller with an
-        error message, instead of triggering a restart that could never
-        recover. Only on success is the marker file written and the
-        graceful full-stack shutdown triggered; tray.py picks up the
-        marker after main.py exits and performs the actual bin/ swap +
-        restart (see tray.py's _check_and_apply_update / _perform_update).
-
-        bin/ itself is never touched by this handler — only DATA_DIR
-        (the marker file) and temp directories are written here.
-        """
-        channel = str(b.get("channel", "")).strip()
-        if channel not in ("release", "main"):
-            self._err(400, "channel must be 'release' or 'main'")
+        # Fix #20: reject a concurrent update attempt outright rather than
+        # letting two staging runs race and leak temp directories.
+        if not _update_lock.acquire(blocking=False):
+            self._json({"ok": False, "error": "An update is already in progress."})
             return
-
         try:
-            staging_dir = _stage_update(channel)
-        except Exception as ex:
-            daemon._mlog(f"✕ Update staging failed ({channel}): {ex}")
-            self._json({"ok": False, "error": str(ex)})
-            return
+            channel = str(b.get("channel", "")).strip()
+            if channel not in ("release", "main"):
+                self._err(400, "channel must be 'release' or 'main'")
+                return
 
-        marker = {
-            "channel":     channel,
-            "stagingDir":  str(staging_dir),
-            "requestedAt": time.time(),
-        }
-        try:
-            (_DATA_DIR / _UPDATE_MARKER_NAME).write_text(json.dumps(marker, indent=2))
-        except Exception as ex:
-            shutil.rmtree(staging_dir, ignore_errors=True)
-            daemon._mlog(f"✕ Could not write update marker: {ex}")
-            self._json({"ok": False, "error": f"Could not write update marker: {ex}"})
-            return
+            try:
+                staging_dir = _stage_update(channel)
+            except Exception as ex:
+                daemon._mlog(f"✕ Update staging failed ({channel}): {ex}")
+                self._json({"ok": False, "error": str(ex)})
+                return
 
-        daemon._mlog(f"✓ Update staged ({channel}) — restarting to apply…")
-        self._json({"ok": True, "message": "Update staged — Maestro is restarting to apply it."})
+            marker = {
+                "channel":     channel,
+                "stagingDir":  str(staging_dir),
+                "requestedAt": time.time(),
+            }
+            try:
+                (_DATA_DIR / _UPDATE_MARKER_NAME).write_text(json.dumps(marker, indent=2))
+            except Exception as ex:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                daemon._mlog(f"✕ Could not write update marker: {ex}")
+                self._json({"ok": False, "error": f"Could not write update marker: {ex}"})
+                return
 
-        def _do():
-            time.sleep(0.3)
-            daemon.kill_all()
-            daemon._stop.set()
-            with daemon._lock:
-                for e in daemon.entries:
-                    daemon._close_subs(e)
-            with daemon._self_subs_lock:
-                for q in daemon._self_subs:
-                    try: q.put_nowait(None)
-                    except: pass
-            if _server:
-                threading.Thread(target=_server.shutdown, daemon=True).start()
+            daemon._mlog(f"✓ Update staged ({channel}) — restarting to apply…")
+            self._json({"ok": True, "message": "Update staged — Maestro is restarting to apply it."})
 
-        threading.Thread(target=_do, daemon=True).start()
+            def _do():
+                time.sleep(0.3)
+                daemon.kill_all()
+                daemon._stop.set()
+                with daemon._lock:
+                    for e in daemon.entries:
+                        daemon._close_subs(e)
+                with daemon._self_subs_lock:
+                    for q in daemon._self_subs:
+                        try: q.put_nowait(None)
+                        except Exception: pass
+                if _server:
+                    threading.Thread(target=_server.shutdown, daemon=True).start()
+
+            threading.Thread(target=_do, daemon=True).start()
+        finally:
+            _update_lock.release()
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -1000,7 +1062,17 @@ def main():
 
     # ── 5. Read server bind parameters from settings ───────────────────────────
     host = _settings.get("host", "127.0.0.1")
-    port = int(_settings.get("port", 8865))
+    if not isinstance(host, str) or not host.strip():
+        host = "127.0.0.1"
+    # Fix #6: defensive fallback in case settings.json somehow already has a
+    # bad port (e.g. edited by hand) — never let a corrupt value crash startup.
+    try:
+        port = int(_settings.get("port", 8865))
+        if not (1 <= port <= 65535):
+            raise ValueError
+    except (TypeError, ValueError):
+        daemon._mlog(f"Invalid port in settings.json ({_settings.get('port')!r}) — using 8865")
+        port = 8865
 
     # ── 6. Single-instance lock ────────────────────────────────────────────────
     if not _check_single():

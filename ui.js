@@ -120,6 +120,17 @@ function _fmtRAM(ram){
 }
 function _fmtStats(cpu,ram){ return `${_fmtCPU(cpu)} | ${_fmtRAM(ram)}`; }
 
+// ── HTML escaping (Fix #5 — stored XSS via unescaped innerHTML) ───────────────
+// Any value that can come from server/API data (webapp URLs, file/dir names,
+// tooltip text) must be escaped before being interpolated into an innerHTML
+// template literal. Plain-text-only insertions use textContent instead and
+// don't need this.
+function _esc(s){
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+
 // ── Poll ──────────────────────────────────────────────────────────────────────
 function _mkHash(es){
   return es.map(e=>
@@ -245,7 +256,11 @@ function updateMaestroBar(){
 // ── Footer ────────────────────────────────────────────────────────────────────
 
 function ftrDefault(){ fQ.classList.remove('hide');fT.classList.remove('show');if(!activeTab||!isWebapp(activeTab))fUrl.classList.remove('show'); }
-function ftrTip(html){ fQ.classList.add('hide');fUrl.classList.remove('show');fT.innerHTML=html;fT.classList.add('show'); }
+// Fix #5: ftrTip is only ever given plain text (tooltip strings from
+// data-tip attributes, which are static in ui.html/ui.js) — use textContent,
+// not innerHTML, so this can never become an XSS vector even if a future
+// caller passes untrusted text.
+function ftrTip(text){ fQ.classList.add('hide');fUrl.classList.remove('show');fT.textContent=text;fT.classList.add('show'); }
 function setStatus(m){
   const s=document.getElementById('ftr-status');
   s.textContent=m;s._tmp=true;clearTimeout(s._t);
@@ -1243,7 +1258,8 @@ function openSettings(){
     const saveSrvBtn=el('button','rbtn sec');saveSrvBtn.textContent='Save Server Settings';
     saveSrvBtn.style.marginTop='4px';
     saveSrvBtn.onclick=async()=>{
-      await api('POST','/api/settings',{host:hostInp.value.trim(),port:parseInt(portInp.value)||8865});
+      const r=await api('POST','/api/settings',{host:hostInp.value.trim(),port:parseInt(portInp.value)||8865});
+      if(r&&r.error){setStatus('Save failed: '+r.error);return;}
       await _fetchSettings();
       setStatus('Server settings saved — restart to apply');
     };
@@ -1256,12 +1272,21 @@ function openSettings(){
     // check for a channel only fires the first time its button is clicked
     // (see _buildUpdateRow above).
     const secUpd=_smSection('Update Maestro');
-    const tokenInp=_smInput('GitHub Token (only needed while the repo is private)','password',s.githubToken||'');
-    tokenInp.placeholder='ghp_… (leave empty once the repo is public)';
+    // Fix #2: the server never sends the real token back (see main.py's
+    // /api/settings GET handler) — only a `githubTokenSet` boolean. Show a
+    // placeholder reflecting that instead of expecting/echoing the real value,
+    // and don't overwrite a saved token with a blank unless the user actually
+    // typed something new.
+    const tokenInp=_smInput('GitHub Token (only needed while the repo is private)','password','');
+    tokenInp.placeholder = s.githubTokenSet
+      ? '•••••••• (already set — leave blank to keep)'
+      : 'ghp_… (leave empty once the repo is public)';
     const btnSaveToken=el('button','rbtn sec');btnSaveToken.textContent='Save Token';
     btnSaveToken.style.marginTop='4px';
     btnSaveToken.onclick=async()=>{
-      await api('POST','/api/settings',{githubToken:tokenInp.value.trim()});
+      const v=tokenInp.value.trim();
+      if(!v && s.githubTokenSet){ setStatus('Token unchanged.'); return; }
+      await api('POST','/api/settings',{githubToken:v});
       await _fetchSettings();
       setStatus('GitHub token saved.');
     };
@@ -1330,10 +1355,19 @@ async function loadExplorerDir(path){
   const lh=document.getElementById('exp-lh'),ll=document.getElementById('exp-ll');
   if(!lh||!ll)return;
   lh.textContent=d.path;ll.innerHTML='';
-  if(d.parent){const r=el('div','exp-item tup');r.innerHTML='📁 ..';r.onclick=()=>loadExplorerDir(d.parent);ll.appendChild(r);}
-  d.dirs.forEach(n=>{const r=el('div','exp-item tdir');r.innerHTML=`📁 ${n}`;r.onclick=()=>loadExplorerDir(d.path+'/'+n);ll.appendChild(r);});
-  d.files.forEach(n=>{const r=el('div','exp-item tfile');r.innerHTML=`📄 ${n}`;
-    r.onclick=()=>{ll.querySelectorAll('.exp-item').forEach(x=>x.classList.remove('tsel'));r.classList.add('tsel');loadExpFile(d.path+'/'+n);};ll.appendChild(r);});
+  // Fix #5: filenames/dirnames come from the filesystem and could contain
+  // markup if an attacker had already dropped a maliciously-named file —
+  // build these rows with textContent, never innerHTML.
+  if(d.parent){
+    const r=el('div','exp-item tup');r.textContent='📁 ..';r.onclick=()=>loadExplorerDir(d.parent);ll.appendChild(r);
+  }
+  d.dirs.forEach(n=>{
+    const r=el('div','exp-item tdir');r.textContent=`📁 ${n}`;r.onclick=()=>loadExplorerDir(d.path+'/'+n);ll.appendChild(r);
+  });
+  d.files.forEach(n=>{
+    const r=el('div','exp-item tfile');r.textContent=`📄 ${n}`;
+    r.onclick=()=>{ll.querySelectorAll('.exp-item').forEach(x=>x.classList.remove('tsel'));r.classList.add('tsel');loadExpFile(d.path+'/'+n);};ll.appendChild(r);
+  });
 }
 async function loadExpFile(path){
   const d=await api('GET',`/api/read-file?path=${encodeURIComponent(path)}`);
@@ -1347,9 +1381,9 @@ async function loadTree(path){
   if(!d||d.error)return;
   const tEl=document.getElementById('lsb-tree'),pEl=document.getElementById('lsb-tree-path');
   if(!tEl)return;pEl.textContent=d.path;tEl.innerHTML='';
-  if(d.parent){const r=el('div','tree-item tup');r.innerHTML='📁 ..';r.onclick=()=>loadTree(d.parent);tEl.appendChild(r);}
+  if(d.parent){const r=el('div','tree-item tup');r.textContent='📁 ..';r.onclick=()=>loadTree(d.parent);tEl.appendChild(r);}
   (d.dirs||[]).forEach(name=>{
-    const r=el('div','tree-item tdir');r.innerHTML=`📁 ${name}`;
+    const r=el('div','tree-item tdir');r.textContent=`📁 ${name}`;
     r.onclick=()=>{loadTree(d.path+'/'+name);if(!panels.includes(EXPLORER_UID))openPanel(EXPLORER_UID);else loadExplorerDir(d.path+'/'+name);};
     tEl.appendChild(r);
   });
@@ -1425,9 +1459,10 @@ async function openFileBrowser(pathInput,insertAfter,filter='sh'){
     const d=await api('GET',url);box.innerHTML='';
     if(d.error){const m=el('div','fb-item fmsg');m.textContent=d.error;box.appendChild(m);return;}
     _fbPath=d.path;pathDiv.textContent=d.path;
-    if(d.parent){const r=el('div','fb-item fup');r.innerHTML='📁 ..';r.onclick=()=>load(d.parent);box.appendChild(r);}
-    (d.dirs||[]).forEach(n=>{const r=el('div','fb-item fdir');r.innerHTML=`📁 ${n}`;r.onclick=()=>load(d.path+'/'+n);box.appendChild(r);});
-    (d.files||[]).forEach(n=>{const r=el('div','fb-item ffile');r.innerHTML=`📄 ${n}`;r.onclick=()=>{pathInput.value=d.path+'/'+n;wrap.remove();};box.appendChild(r);});
+    // Fix #5: filesystem-derived names via textContent, never innerHTML.
+    if(d.parent){const r=el('div','fb-item fup');r.textContent='📁 ..';r.onclick=()=>load(d.parent);box.appendChild(r);}
+    (d.dirs||[]).forEach(n=>{const r=el('div','fb-item fdir');r.textContent=`📁 ${n}`;r.onclick=()=>load(d.path+'/'+n);box.appendChild(r);});
+    (d.files||[]).forEach(n=>{const r=el('div','fb-item ffile');r.textContent=`📄 ${n}`;r.onclick=()=>{pathInput.value=d.path+'/'+n;wrap.remove();};box.appendChild(r);});
     if(!d.dirs?.length&&!d.files?.length){const m=el('div','fb-item fmsg');m.textContent='Empty folder';box.appendChild(m);}
   }
   load(_fbPath||_treeCurrentPath||'/home');
