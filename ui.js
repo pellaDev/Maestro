@@ -49,6 +49,7 @@ const SLOW_RETRY_MS  = 15000;  // gap between attempts once in the persistent sl
 let _lastPollOk = Date.now();    // timestamp of the last successful /api/state response
 let _lastPollNetErr = false;     // true = last poll failed with a real fetch error; false = just stale (throttled timer)
 let _staleActive = false;        // guards against overlapping reconnect attempts
+let _staleNotified = false;      // guards against spamming an OS notification on every slow-retry attempt
 let _reconnectTimer = null;      // setTimeout id for the current pending reconnect attempt
 
 let _widePanels={};
@@ -72,6 +73,7 @@ document.addEventListener('visibilitychange',()=>{
 const fQ=document.getElementById('ftr-quote');
 const fUrl=document.getElementById('ftr-url');
 const fT=document.getElementById('ftr-tip');
+const fOv=document.getElementById('ftr-overlay');
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 function g(fn){ let t=0; return function(...a){const n=Date.now();if(n-t<500)return;t=n;fn(...a);}; }
@@ -143,7 +145,7 @@ function _mkHash(es){
 
 async function poll(){
   const d=await api('GET','/api/state');
-  if(d&&d.entries){ _lastPollOk=Date.now(); _lastPollNetErr=false; } else { _lastPollNetErr=true; }
+  if(d&&d.entries){ _lastPollOk=Date.now(); _lastPollNetErr=false; _setConnText('— CONNECTED —'); } else { _lastPollNetErr=true; }
   if(!d||!d.entries) return;
   entries=d.entries;
   if(d.loggingEnabled!==undefined) _loggingEnabled=d.loggingEnabled;
@@ -218,7 +220,7 @@ function _pollSoon(){
 // Use after batch operations where daemon state may lag behind.
 async function forcePoll(){
   const d=await api('GET','/api/state');
-  if(d&&d.entries){ _lastPollOk=Date.now(); _lastPollNetErr=false; } else { _lastPollNetErr=true; }
+  if(d&&d.entries){ _lastPollOk=Date.now(); _lastPollNetErr=false; _setConnText('— CONNECTED —'); } else { _lastPollNetErr=true; }
   if(!d||!d.entries) return;
   entries=d.entries;
   if(d.loggingEnabled!==undefined) _loggingEnabled=d.loggingEnabled;
@@ -267,31 +269,37 @@ function setStatus(m){
   s._t=setTimeout(()=>{s._tmp=false;s.textContent='';updateFooterForActiveTab();},3500);
 }
 
-// ── Footer alert (bold/colored, used for the stale-connection watchdog) ──────
-// Shares the #ftr-status element with setStatus() — sets s._tmp so
-// updateFooterForActiveTab() won't clobber it while active, exactly like
-// setStatus() already does for regular short-lived status messages.
-// opts.clickable makes the message itself act as a manual "retry now" button.
-function _footerAlert(msg,opts={}){
-  const s=document.getElementById('ftr-status');
-  clearTimeout(s._t);
-  s._tmp=true;
-  s.style.color=opts.color||'';
-  s.style.fontWeight=opts.bold?'700':'';
-  s.style.cursor=opts.clickable?'pointer':'';
-  s.title=opts.clickable?'Click to retry now':'';
-  s.onclick=opts.clickable?()=>{
-    clearTimeout(_reconnectTimer);
-    _reconnectCycle(FAST_TRIES); // skip straight to another attempt, bypassing the wait
-  }:null;
-  s.textContent=msg;
-  if(opts.autoClear!==false){
-    s._t=setTimeout(()=>{
-      s._tmp=false;s.style.color='';s.style.fontWeight='';s.style.cursor='';s.title='';s.onclick=null;s.textContent='';
-      updateFooterForActiveTab();
-    },opts.duration||3500);
+// ── Real connection status text (replaces the old static footer quote) ──────
+// Shown in #ftr-quote whenever no connection-notification overlay is active
+// and no webapp-tab URL/tooltip is being displayed — so the user can tell
+// at a glance, before clicking anything, whether the tab is actually live.
+function _setConnText(text){ fQ.textContent=text; }
+_setConnText('— CONNECTING… —');
+
+// ── Full-footer overlay (traffic-light connection notifications) ────────────
+// Covers #ftr-inner completely with a flat, bold, uppercase, centered message
+// in a color that maps to severity — green=reconnected, yellow=tab
+// suspended/reconnecting, red=server unreachable/give-up-and-retry. Replaces
+// the old small colored text in the corner (#ftr-status), which was too easy
+// to miss entirely.
+function _connOverlay(msg,{color='red',clickable=false,duration=0,onClick=null}={}){
+  clearTimeout(fOv._t);
+  fOv.className='show ov-'+color+(clickable?' clickable':'');
+  fOv.textContent=msg;
+  fOv.onclick=clickable?onClick:null;
+  if(duration>0){
+    fOv._t=setTimeout(()=>{ _hideConnOverlay(); },duration);
   }
 }
+function _hideConnOverlay(){
+  clearTimeout(fOv._t);
+  fOv.className='';fOv.textContent='';fOv.onclick=null;
+}
+
+// (old _footerAlert — small colored corner text — removed; connection-state
+// notifications now use the full-footer _connOverlay() above. #ftr-status
+// remains only for short one-off action feedback via setStatus(), e.g.
+// "Saved.", "Launch failed: ...".)
 
 // ── Force-reconnect all SSE connections ───────────────────────────────────────
 // EventSource.readyState is NOT trustworthy after a browser tab suspend/resume:
@@ -330,9 +338,9 @@ async function _checkStale(){
   _staleActive=true;
   _forceReconnectAllSSE();
   const msg=_lastPollNetErr
-    ?'⚠ SERVER NON RAGGIUNGIBILE — riconnessione…'
-    :'⚠ TAB SOSPESA DAL BROWSER — riconnessione…';
-  _footerAlert(msg,{color:'var(--red)',bold:true,autoClear:false});
+    ?'SERVER NON RAGGIUNGIBILE — RICONNESSIONE…'
+    :'TAB SOSPESA DAL BROWSER — RICONNESSIONE…';
+  _connOverlay(msg,{color:_lastPollNetErr?'red':'yellow'});
   await _reconnectCycle(0);
 }
 
@@ -363,13 +371,30 @@ async function _reconnectCycle(attempt){
     _reconnectTimer=setTimeout(()=>_reconnectCycle(attempt+1),FAST_GAP_MS);
     return;
   }
-  _footerAlert('✕ Riconnessione in corso… clic per riprovare subito',
-    {color:'var(--red)',bold:true,autoClear:false,clickable:true});
+  // Fast retries exhausted without recovering — this is no longer a quick
+  // blip, it's worth surfacing via an OS-level notification too, since the
+  // user may not be looking at this tab (or any tab) right now. Fired once
+  // per stale episode, not on every subsequent slow-phase retry.
+  if(!_staleNotified){
+    _staleNotified=true;
+    notify('Maestro — connessione persa',
+      'La tab non risponde da un po\u2019. Riconnessione automatica in corso in background.');
+  }
+  _connOverlay('RICONNESSIONE IN CORSO — CLIC PER RIPROVARE SUBITO',{
+    color:'red',clickable:true,
+    onClick:()=>{ clearTimeout(_reconnectTimer); _reconnectCycle(FAST_TRIES); },
+  });
   _reconnectTimer=setTimeout(()=>_reconnectCycle(attempt+1),SLOW_RETRY_MS);
 }
 
 function _onReconnected(){
   clearTimeout(_reconnectTimer);_reconnectTimer=null;
+  // Only notify "reconnected" if we actually notified "connection lost"
+  // earlier in this episode — otherwise a routine fast-phase recovery
+  // (which never reached the slow phase) would fire a notification the
+  // user never asked for, for a blip they likely never even noticed.
+  if(_staleNotified) notify('Maestro — riconnesso', 'La connessione è stata ripristinata.');
+  _staleNotified=false;
   // SSE connections were already unconditionally force-closed and reopened by
   // _forceReconnectAllSSE() when this stale episode started (see _checkStale)
   // — nothing more to do for them here, and readyState isn't trustworthy
@@ -385,7 +410,7 @@ function _onReconnected(){
     const e=entries.find(x=>x.uid===m[1]);
     if(e&&e.pid) reloadWebTab(uid);
   });
-  _footerAlert('✓ RICONNESSO!',{color:'var(--grn)',bold:true,duration:3000});
+  _connOverlay('RICONNESSO!',{color:'green',duration:2500});
   _staleActive=false;
 }
 
@@ -972,6 +997,19 @@ async function doLaunch(uid){
   const e=entries.find(x=>x.uid===uid);if(!e)return;
   const r=await api('POST','/api/launch',{uid});
   if(r&&r.error){setStatus('Launch failed: '+r.error);return;}
+  // Optimistic UI update: right after a tab wakes from background sleep, the
+  // browser's per-origin connection pool can still be draining/reopening SSE
+  // sockets (see _forceReconnectAllSSE), so the very next /api/state poll's
+  // fetch can queue behind them and resolve a beat late. Without this, the
+  // sidebar/panel dot stayed grey until a SECOND click happened to land after
+  // that delayed poll finally came back — even though the launch itself
+  // already succeeded server-side on the first click. Set a truthy
+  // placeholder PID immediately so the dot flips to "run" right away; the
+  // next real poll overwrites entries[] wholesale with the true state anyway
+  // (correcting back to stopped if the launch actually failed server-side
+  // after this point).
+  e.pid=e.pid||-1;
+  document.querySelectorAll(`[data-pdot="${uid}"]`).forEach(d=>d.className='dot run');
   if(!panels.includes(uid)){
     panels.push(uid);
     if(!e.launchHidden){
@@ -995,6 +1033,9 @@ async function doKill(uid){
   const e=entries.find(x=>x.uid===uid);if(!e)return;
   const r=await api('POST','/api/kill',{uid});
   if(r.error){setStatus('Kill failed: '+r.error);return;}
+  // Optimistic UI update — same reasoning as doLaunch() above.
+  e.pid=null;e.crash=false;
+  document.querySelectorAll(`[data-pdot="${uid}"]`).forEach(d=>d.className='dot stop');
   (e.webapps||[]).forEach((_,wi)=>{
     const wuid=`${uid}_w${wi}`;_tabReady.delete(wuid);
     const ifr=tabIframes[wuid];if(ifr){ifr.style.opacity='0';ifr.src='about:blank';}
@@ -1102,8 +1143,8 @@ async function doUpdateMaestro(channel){
   // silently killing every update attempt with no visible error — the fetch
   // rejected, the fallback status message flashed for only 3.5s in the small
   // footer text, and it looked exactly like "clicking Update does nothing".
-  _footerAlert(`⬇ Downloading ${channel} update… this can take up to a minute`,
-    {color:'var(--acc4)',bold:true,autoClear:false});
+  _connOverlay(`DOWNLOAD ${channel.toUpperCase()} IN CORSO… PUÒ RICHIEDERE FINO A UN MINUTO`,
+    {color:'yellow'});
 
   let r;
   try{
@@ -1116,7 +1157,7 @@ async function doUpdateMaestro(channel){
     r=await res.json();
   }catch(ex){
     console.error('Update Maestro request failed:',ex);
-    _footerAlert('✕ Update failed: '+String(ex),{color:'var(--red)',bold:true,duration:8000});
+    _connOverlay('AGGIORNAMENTO FALLITO: '+String(ex),{color:'red',duration:8000});
     return;
   }
 
@@ -1129,7 +1170,7 @@ async function doUpdateMaestro(channel){
       'Restarting to apply the update — reload this page in a few seconds.</small></div>';
   } else {
     console.error('Update Maestro failed:',r);
-    _footerAlert('✕ Update failed: '+((r&&r.error)||'?'),{color:'var(--red)',bold:true,duration:8000});
+    _connOverlay('AGGIORNAMENTO FALLITO: '+((r&&r.error)||'?'),{color:'red',duration:8000});
   }
 }
 
