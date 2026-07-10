@@ -69,6 +69,52 @@ document.addEventListener('visibilitychange',()=>{
   if(_pageVisible){ _forceReconnectAllSSE(); poll(); _checkStale(); }
 });
 
+// ── Background-tab keepalive (silent audio) ──────────────────────────────────
+// Root-cause mitigation for the stale-connection problem the watchdog above
+// works around: Chrome (and Chromium-based browsers) aggressively throttles
+// or fully freezes JS timers in background/minimized tabs, which is what
+// stalls poll() and lets SSE connections go stale in the first place. Tabs
+// that are actively producing audio are exempted from the most aggressive
+// throttling tiers — the same mechanism many "always responsive" webapps
+// (chat/messaging apps, etc.) rely on, without needing WebSockets or a
+// Service Worker. A near-silent, inaudible oscillator is enough to get the
+// exemption without making any actual sound.
+//
+// Zero network calls, zero new attack surface — 100% client-side, no data
+// involved. Does NOT survive an actual OS-level system sleep/suspend (lid
+// closed, etc.) — nothing in JS can prevent that, this only helps with
+// ordinary background-tab throttling while the machine itself stays awake.
+//
+// Started on the user's first interaction with the page (click/key/touch) —
+// required because browsers block audio autoplay without a prior gesture.
+let _keepaliveCtx = null;
+function _startKeepaliveAudio(){
+  if(_keepaliveCtx) return; // already running
+  try{
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if(!AC) return; // unsupported browser — not critical, just skip
+    _keepaliveCtx = new AC();
+    const osc  = _keepaliveCtx.createOscillator();
+    const gain = _keepaliveCtx.createGain();
+    gain.gain.value = 0.0001;    // effectively silent — non-zero on purpose,
+                                  // to avoid any "no audible output" auto-
+                                  // suspend heuristic some browsers apply
+    osc.frequency.value = 20000; // also outside normal human hearing range
+    osc.connect(gain).connect(_keepaliveCtx.destination);
+    osc.start();
+  }catch(e){
+    _keepaliveCtx = null; // feature-detection failed at runtime — just skip
+  }
+}
+['click','keydown','touchstart'].forEach(ev=>
+  document.addEventListener(ev,_startKeepaliveAudio,{once:true})
+);
+// Resume if the browser auto-suspended it for any reason (e.g. right after a
+// system sleep/resume cycle) — cheap no-op if it's already running.
+document.addEventListener('visibilitychange',()=>{
+  if(_keepaliveCtx && _keepaliveCtx.state==='suspended') _keepaliveCtx.resume().catch(()=>{});
+});
+
 // DOM refs needed by poll callbacks — must be initialized before any async poll result
 const fQ=document.getElementById('ftr-quote');
 const fUrl=document.getElementById('ftr-url');
