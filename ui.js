@@ -20,8 +20,6 @@ let _prevHash='',_loggingEnabled=true;
 let _settings={};
 let _treeCurrentPath=null,_fbPath=null,_explorerPath=null;
 let _pageVisible=!document.hidden;
-let _sysCpu=0,_sysRam=0,_sysRamTotal=0;
-let _gpu={gpu:0,vramUsed:0,vramTotal:0};
 const _tabReady=new Set();
 
 // ── Stale connection watchdog state ─────────────────────────────────────────────
@@ -163,7 +161,9 @@ function _fmtCPU(cpu){
 }
 function _fmtRAM(ram){
   const v=typeof ram==='number'?ram:0;
-  const pct=_sysRamTotal>0?v/_sysRamTotal*100:Math.min(v/4096*100,100);
+  // Per-process RAM has no system total to compare against; the colour scale
+  // uses a fixed 4 GB reference (purely cosmetic).
+  const pct=Math.min(v/4096*100,100);
   return `RAM ${_resNum(_toGB(v),pct)}`;
 }
 function _fmtStats(cpu,ram){ return `${_fmtCPU(cpu)} | ${_fmtRAM(ram)}`; }
@@ -195,10 +195,6 @@ async function poll(){
   if(!d||!d.entries) return;
   entries=d.entries;
   if(d.loggingEnabled!==undefined) _loggingEnabled=d.loggingEnabled;
-  if(d.gpu)             _gpu=d.gpu;
-  if(d.sysCpu!==undefined)     _sysCpu=d.sysCpu;
-  if(d.sysRam!==undefined)     _sysRam=d.sysRam;
-  if(d.sysRamTotal!==undefined) _sysRamTotal=d.sysRamTotal;
 
   const h=_mkHash(entries);
   if(h!==_prevHash){ _prevHash=h; renderSidebar(); }
@@ -208,7 +204,6 @@ async function poll(){
   updatePanelMeta();
   patchPanelTitles();
   _patchPanelColors();
-  if(_pageVisible) updateMaestroBar();
   updateFooterForActiveTab();
   _updateMaestroEye();
 
@@ -270,10 +265,6 @@ async function forcePoll(){
   if(!d||!d.entries) return;
   entries=d.entries;
   if(d.loggingEnabled!==undefined) _loggingEnabled=d.loggingEnabled;
-  if(d.gpu)             _gpu=d.gpu;
-  if(d.sysCpu!==undefined)     _sysCpu=d.sysCpu;
-  if(d.sysRam!==undefined)     _sysRam=d.sysRam;
-  if(d.sysRamTotal!==undefined) _sysRamTotal=d.sysRamTotal;
   // Force full re-render ignoring hash
   _prevHash='';
   renderSidebar();
@@ -281,7 +272,6 @@ async function forcePoll(){
   updatePanelMeta();
   patchPanelTitles();
   _patchPanelColors();
-  if(_pageVisible) updateMaestroBar();
   updateFooterForActiveTab();
   _updateMaestroEye();
 }
@@ -289,17 +279,7 @@ async function forcePoll(){
 setInterval(()=>{ if(_pageVisible)poll(); },2000);
 poll();
 
-// ── Maestro bar ───────────────────────────────────────────────────────────────
-function updateMaestroBar(){
-  if(!_pageVisible) return;
-  const mb=document.getElementById('mb-resources'); if(!mb) return;
-  const ramPct=_sysRamTotal>0?_sysRam/_sysRamTotal*100:0;
-  const vramPct=_gpu.vramTotal>0?_gpu.vramUsed/_gpu.vramTotal*100:0;
-  const ramStr=_sysRamTotal>0?`${_toGB(_sysRam)}/${_toGB(_sysRamTotal)}`:`${_toGB(_sysRam)}`;
-  let html=`CPU ${_resNum(_sysCpu.toFixed(1)+'%',_sysCpu)} | RAM ${_resNum(ramStr,ramPct)}`;
-  if(_gpu.vramTotal>0) html+=` | GPU ${_resNum(_gpu.gpu+'%',_gpu.gpu)} | VRAM ${_resNum(_toGB(_gpu.vramUsed)+'/'+_toGB(_gpu.vramTotal),vramPct)}`;
-  mb.innerHTML=html;
-}
+
 
 // ── Footer ────────────────────────────────────────────────────────────────────
 
@@ -1166,22 +1146,14 @@ function doAddSep(){
 }
 
 // ── Update Maestro (Settings modal) ───────────────────────────────────────────
-// Applies a full Maestro update from GitHub — either channel "release"
-// (the latest tagged GitHub Release — labeled "Latest" in the UI, matching
-// GitHub's own flag for it) or "main" (main branch HEAD — labeled
-// "Pre-release" in the UI, matching GitHub's vocabulary for anything that
-// isn't the flagged Latest release). See main.py's /api/update-maestro and
-// tray.py's _perform_update()/_reexec_self() for the server-side
-// download/stage/swap/restart sequence. This stops ALL running managed
-// scripts (full-stack restart, by design — see MAESTRO_GUIDE.md).
-async function doUpdateMaestro(channel){
-  const label=channel==='release'?'Latest (tagged release)':'Pre-release (main branch)';
-  if(!confirm(
-    `Update Maestro to ${label}?\n\n`+
-    `This will stop ALL running scripts and restart Maestro. `+
-    `No automatic backup is kept.`
-  )) return;
-
+// Applies a full Maestro update from GitHub — either a channel ("release":
+// the latest tagged GitHub Release, labeled "Latest" in the UI; or "main":
+// main branch HEAD, labeled "Pre-release") or an explicit tag (any released
+// version, including older ones — used by CHECK ALL VERSIONS for rollbacks).
+// See main.py's /api/update-maestro and tray.py's _perform_update()/_reexec_self()
+// for the server-side download/stage/swap/restart sequence. This stops ALL
+// running managed scripts (full-stack restart, by design).
+async function _runMaestroInstall(payload,label){
   // NOTE: this deliberately does NOT use api() — api()'s AbortSignal.timeout
   // is hardcoded to API_TIMEOUT_MS (6s), tuned for ordinary fast calls. The
   // server-side work here (download + extract + validate a GitHub zip) can
@@ -1189,7 +1161,7 @@ async function doUpdateMaestro(channel){
   // silently killing every update attempt with no visible error — the fetch
   // rejected, the fallback status message flashed for only 3.5s in the small
   // footer text, and it looked exactly like "clicking Update does nothing".
-  _connOverlay(`DOWNLOAD ${channel.toUpperCase()} IN CORSO… PUÒ RICHIEDERE FINO A UN MINUTO`,
+  _connOverlay(`DOWNLOAD ${label.toUpperCase()} IN CORSO… PUÒ RICHIEDERE FINO A UN MINUTO`,
     {color:'yellow'});
 
   let r;
@@ -1197,7 +1169,7 @@ async function doUpdateMaestro(channel){
     const res=await fetch('/api/update-maestro',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({channel}),
+      body:JSON.stringify(payload),
       signal:AbortSignal.timeout(120000),
     });
     r=await res.json();
@@ -1219,6 +1191,81 @@ async function doUpdateMaestro(channel){
     _connOverlay('AGGIORNAMENTO FALLITO: '+((r&&r.error)||'?'),{color:'red',duration:8000});
   }
 }
+
+async function doUpdateMaestro(channel){
+  const label=channel==='release'?'Latest (tagged release)':'Pre-release (main branch)';
+  if(!confirm(
+    `Update Maestro to ${label}?\n\n`+
+    `This will stop ALL running scripts and restart Maestro. `+
+    `No automatic backup is kept.`
+  )) return;
+  await _runMaestroInstall({channel},channel);
+}
+
+// Tiny client-side version compare (mirrors main.py's _cmp_versions) — only
+// used to warn the user when CHECK ALL VERSIONS would install an OLDER tag.
+function _verT(v){const p=String(v||'').replace(/^[vV]/,'').split(/[.\-+]/);return [0,1,2].map(i=>{const n=parseInt(p[i],10);return Number.isFinite(n)?n:0;});}
+function _cmpVer(a,b){const ta=_verT(a),tb=_verT(b);for(let i=0;i<3;i++){if(ta[i]!==tb[i])return ta[i]<tb[i]?-1:1;}return 0;}
+
+// CHECK ALL VERSIONS row: first click fetches every installable GitHub release
+// (GET /api/update-check-all, sorted newest-first) and turns the row into a
+// version dropdown + an "INSTALL THIS VERSION" button; clicking it again
+// installs the selected tag — even an older one (rollback).
+function _buildAllVersionsRow(){
+  const wrap=el('div','');wrap.style.cssText='display:flex;flex-direction:column;gap:4px';
+  const btn=el('button','sm-btn');
+  btn.textContent='CHECK ALL VERSIONS';
+  btn.dataset.state='check';
+  const selWrap=el('div','');selWrap.style.display='none';
+  const sel=el('select','finput');
+  let localVer='';
+  selWrap.appendChild(sel);
+
+  btn.onclick=async()=>{
+    if(btn.dataset.state==='install'){
+      const tag=(sel.value||'').trim();
+      if(!tag) return;
+      const rollback=localVer&&_cmpVer(tag,localVer)<0;
+      if(!confirm(
+        `Install Maestro v${tag}?\n\n`+
+        (rollback?'⚠ This is a ROLLBACK to an older version.\n\n':'')+
+        `This will stop ALL running scripts and restart Maestro. No automatic backup is kept.`
+      )) return;
+      await _runMaestroInstall({tag},'v'+tag);
+      return;
+    }
+    btn.disabled=true;btn.textContent='Checking…';
+    try{
+      const r=await api('GET','/api/update-check-all');
+      if(!r||!r.ok) throw new Error((r&&r.error)||'unknown error');
+      localVer=r.localVersion||'';
+      sel.innerHTML='';
+      (r.releases||[]).forEach(rel=>{
+        const o=document.createElement('option');
+        o.value=rel.tag;
+        let suffix='';
+        if(rel.isCurrent) suffix+=' (current)';
+        if(rel.prerelease) suffix+=' (pre-release)';
+        o.textContent=`v${rel.version}${suffix}`;
+        sel.appendChild(o);
+      });
+      // List is sorted newest-first, so the default selection is the newest.
+      btn.dataset.state='install';
+      btn.textContent='INSTALL THIS VERSION';
+      selWrap.style.display='block';
+    }catch(ex){
+      console.error('All-versions check failed:',ex);
+      btn.textContent='CHECK ALL VERSIONS';
+      _connOverlay('CHECK ALL VERSIONS FALLITO: '+String(ex),{color:'red',duration:6000});
+    }finally{
+      btn.disabled=false;
+    }
+  };
+
+  wrap.append(btn,selWrap);
+  return wrap;
+}
+
 
 // Builds one row of the Update Maestro section: a single button that starts
 // as "CHECK <LABEL>", runs GET /api/update-check?channel=... on click (using
@@ -1292,7 +1339,7 @@ function openSettings(){
     btnSupport.href='https://github.com/sponsors/apellaman/';btnSupport.target='_blank';
     btnSupport.textContent='💛 Support me on Github';
     const btnStar=el('a','sm-btn');
-    btnStar.href='https://github.com/AIdevelopmentPit/Maestro';btnStar.target='_blank';
+    btnStar.href='https://github.com/pellaDev/Maestro';btnStar.target='_blank';
     btnStar.textContent='⭐ Star me on GitHub';
     // NOTE: GitHub does not offer any URL/deep-link that stars a repo on
     // click — starring is an authenticated POST action with no anonymous
@@ -1379,12 +1426,85 @@ function openSettings(){
     };
     const updWarn=el('div','sm-warn');
     updWarn.textContent='⚠ Updating stops ALL running scripts and restarts Maestro. No automatic backup is kept.';
+    // Auto-update: at startup, if this setting is on, tray.py compares the local
+    // badge version against the latest tagged GitHub Release ("release" channel
+    // only) and applies it when local is older — see tray.py's
+    // _maybe_auto_update(). It never auto-installs pre-releases.
+    const autoUpdTog=_smToggle('Auto-update to latest stable at startup','autoUpdate',!!s.autoUpdate,async v=>{
+      const r=await api('POST','/api/settings',{autoUpdate:v});
+      if(r&&r.error){setStatus('Save failed: '+r.error);return;}
+      await _fetchSettings();
+    });
     secUpd.append(
-      tokenInp._wrap,btnSaveToken,updWarn,
+      tokenInp._wrap,btnSaveToken,updWarn,autoUpdTog,
       _buildUpdateRow('release','Latest'),
       _buildUpdateRow('main','Pre-release'),
+      _buildAllVersionsRow(),
     );
     body.appendChild(secUpd);
+
+    // ── Backup / Restore section ───────────────────────────────────────────────
+    // Export/import of the full Maestro state: script list (with SEP rows) and
+    // settings.json. Import replaces everything, stops all running scripts, and
+    // starts every imported entry as OFF — see main.py's /api/export and
+    // /api/import handlers.
+    const secBak=_smSection('Backup / Restore');
+    const bakDesc=el('div','');
+    bakDesc.style.cssText='font-size:11px;color:var(--txt2);line-height:1.5';
+    bakDesc.textContent='Export or import the full Maestro state: script list (with SEP rows) and settings. Import replaces everything, stops all running scripts, and every imported entry starts as OFF.';
+    const btnExp=el('button','rbtn sec');btnExp.textContent='⬇ EXPORT STATE';
+    const btnImp=el('button','rbtn sec');btnImp.textContent='⬆ IMPORT STATE';
+    const bakBtns=el('div','');bakBtns.style.cssText='display:flex;gap:8px';
+    bakBtns.append(btnExp,btnImp);
+    const fileInp=el('input','');fileInp.type='file';fileInp.accept='.json,application/json';fileInp.style.display='none';
+    btnExp.onclick=async()=>{
+      try{
+        const res=await fetch('/api/export');
+        const r=await res.json();
+        if(!r||r.app!=='Maestro') throw new Error('export failed');
+        const blob=new Blob([JSON.stringify(r,null,2)],{type:'application/json'});
+        const url=URL.createObjectURL(blob);
+        const a=document.createElement('a');
+        const d=new Date();
+        const stamp=`${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
+        a.href=url;a.download='maestro-backup-'+stamp+'.json';
+        document.body.appendChild(a);a.click();a.remove();
+        URL.revokeObjectURL(url);
+      }catch(ex){
+        console.error('Export state failed:',ex);
+        setStatus('Export failed: '+String(ex));
+      }
+    };
+    btnImp.onclick=()=>fileInp.click();
+    fileInp.onchange=async()=>{
+      const f=fileInp.files&&fileInp.files[0];
+      if(!f) return;
+      let bundle;
+      try{ bundle=JSON.parse(await f.text()); }catch(ex){ setStatus('Import failed: not valid JSON'); return; }
+      if(!bundle||bundle.app!=='Maestro'){ setStatus('Import failed: not a Maestro backup file'); return; }
+      if(!confirm(
+        'Import this Maestro state?\n\n'+
+        'This REPLACES the current script list and settings, stops ALL running scripts, and every imported entry starts as OFF.'
+      )){ fileInp.value=''; return; }
+      try{
+        const r=await api('POST','/api/import',bundle);
+        if(!r||!r.error){
+          Object.values(sseConns).forEach(es=>es.close());sseConns={};sessionStorage.clear();
+          _prevHash='';
+          await _fetchSettings();
+          closeSettings();
+          poll();
+        } else {
+          setStatus('Import failed: '+r.error);
+        }
+      }catch(ex){
+        console.error('Import state failed:',ex);
+        setStatus('Import failed: '+String(ex));
+      }
+      fileInp.value='';
+    };
+    secBak.append(bakDesc,bakBtns,fileInp);
+    body.appendChild(secBak);
   });
 
   document.getElementById('settings-backdrop').classList.add('show');

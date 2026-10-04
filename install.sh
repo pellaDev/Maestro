@@ -137,7 +137,7 @@ echo -e "${BOLD}  ██║ ╚═╝ ██║██║  ██║████�
 echo -e "${DIM}  ╚═╝     ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ${RST}v2.0"
 echo ""
 echo -e "  Privacy-first process orchestrator for Linux"
-echo -e "  ${DIM}https://github.com/AIdevelopmentPit/Maestro${RST}"
+echo -e "  ${DIM}https://github.com/pellaDev/Maestro${RST}"
 if [[ -n "$_DISTRO_ID" ]]; then
   echo -e "  ${DIM}Detected distro: ${_DISTRO_ID}${RST}"
 fi

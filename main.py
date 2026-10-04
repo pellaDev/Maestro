@@ -84,9 +84,9 @@ _TEXT_EXTS = {
 # recently published release explicitly flagged prerelease:true) — it no
 # longer looks at the main branch HEAD at all, so an untagged commit on main
 # is invisible to both channels until it's cut as a vX.Y.Z (or vX.Y) tag.
-_GITHUB_REPO         = "AIdevelopmentPit/Maestro"
+_GITHUB_REPO         = "pellaDev/Maestro"
 _GITHUB_RELEASES_API = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
-_GITHUB_ALL_RELEASES_API = f"https://api.github.com/repos/{_GITHUB_REPO}/releases"
+_GITHUB_ALL_RELEASES_API = f"https://api.github.com/repos/{_GITHUB_REPO}/releases?per_page=100"
 _UPDATE_MARKER_NAME  = "update_request.json"
 
 _UPDATE_SRC_FILES = [
@@ -172,7 +172,21 @@ def _github_resolve_channel_release(channel: str, token: str) -> dict:
     )
 
 
-def _resolve_update_zip_api_url(channel: str, token: str) -> str:
+def _resolve_update_zip_api_url(channel: str = None, token: str = "", tag: str = None) -> str:
+    """Return the GitHub zipball URL for a channel ("release"/"main") or,
+    when an explicit tag is given (any installable version — including
+    rollback to an older one), for that exact release."""
+    if tag:
+        releases = _github_api_get_json(_GITHUB_ALL_RELEASES_API, token)
+        if not isinstance(releases, list):
+            raise RuntimeError("GitHub API did not return a release list")
+        for rel in releases:
+            if (rel.get("tag_name") or "").strip() == tag.strip():
+                url = rel.get("zipball_url", "")
+                if not url:
+                    raise RuntimeError(f"GitHub API did not return a zipball_url for tag '{tag}'")
+                return url
+        raise RuntimeError(f"Tag '{tag}' not found among the releases on GitHub")
     rel = _github_resolve_channel_release(channel, token)
     url = rel.get("zipball_url", "")
     if not url:
@@ -180,9 +194,13 @@ def _resolve_update_zip_api_url(channel: str, token: str) -> str:
     return url
 
 
-def _stage_update(channel: str) -> Path:
-    token = str(_settings.get("githubToken", "")).strip()
-    url = _resolve_update_zip_api_url(channel, token)
+def _stage_update(channel: str = None, tag: str = None, token: str = None) -> Path:
+    """Download + validate the requested release into a temp staging dir.
+    `token` defaults to the githubToken from settings (main.py context);
+    tray.py passes it explicitly since its own settings copy is separate."""
+    if token is None:
+        token = str(_settings.get("githubToken", "")).strip()
+    url = _resolve_update_zip_api_url(channel, token, tag=tag)
 
     tmp_zip_fd, tmp_zip_path = tempfile.mkstemp(suffix=".zip")
     os.close(tmp_zip_fd)
@@ -260,6 +278,26 @@ def _fetch_remote_badge_version(ref: str, token: str) -> str:
         raise RuntimeError("Could not find a version badge in the remote ui.html")
     return m.group(1)
 
+
+def _version_tuple(v: str) -> tuple:
+    """Parse 'X.Y[.Z]' into a zero-padded 3-tuple for numeric comparison."""
+    parts = []
+    for p in v.strip().split("."):
+        try:
+            parts.append(int(p))
+        except ValueError:
+            break
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
+
+
+def _cmp_versions(a: str, b: str) -> int:
+    """Compare dotted numeric versions: -1 if a<b, 0 if equal, 1 if a>b."""
+    ta, tb = _version_tuple(a), _version_tuple(b)
+    return (ta > tb) - (ta < tb)
+
+
 # ── Settings ───────────────────────────────────────────────────────────────────
 _DEFAULT_SETTINGS: dict = {
     "fileExplorer":        False,
@@ -268,6 +306,7 @@ _DEFAULT_SETTINGS: dict = {
     "autostart":           False,
     "trayPersistent":      True,
     "systemNotifications": True,
+    "autoUpdate":          False,
     "host":                "127.0.0.1",
     "port":                8865,
     "dataDir":             "",
@@ -430,6 +469,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(safe)
         elif path == "/api/update-check":
             self._api_update_check()
+        elif path == "/api/update-check-all":
+            self._api_update_check_all()
+        elif path == "/api/export":
+            self._api_export()
         elif path.startswith("/img/"):
             fn  = Path(path[len("/img/"):]).name
             ext = fn.rsplit(".", 1)[-1].lower() if "." in fn else ""
@@ -461,6 +504,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/settings":       self._post_settings,
             "/api/shutdown":       self._shutdown,
             "/api/update-maestro": self._update_maestro,
+            "/api/import":         self._import_state,
         }.get(route)
         if fn:
             fn(body)
@@ -563,14 +607,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _api_state(self):
         with daemon._lock:
             data = [e.to_dict(i) for i, e in enumerate(daemon.entries)]
-        ram_used, ram_total = daemon._read_sys_ram()
         self._json({
             "entries":        data,
             "loggingEnabled": daemon._logging_enabled,
-            "gpu":            daemon._read_gpu(),
-            "sysCpu":         daemon._sys_cpu,
-            "sysRam":         ram_used,
-            "sysRamTotal":    ram_total,
         })
 
     def _api_logs(self, uid: str):
@@ -723,6 +762,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "localVersion":  local_ver,
                 "message":       message,
             })
+        except Exception as ex:
+            self._json({"ok": False, "error": str(ex)})
+
+    def _api_update_check_all(self):
+        """List every installable release on GitHub (newest first) with the
+        local version, so the UI can offer any of them — including rollback.
+        Versions come from tag names (no per-release ui.html fetch)."""
+        token = str(_settings.get("githubToken", "")).strip()
+        try:
+            releases = _github_api_get_json(_GITHUB_ALL_RELEASES_API, token)
+            if not isinstance(releases, list):
+                raise RuntimeError("GitHub API did not return a release list")
+            local_ver = _read_local_badge_version()
+            out = []
+            for rel in releases:
+                tag = (rel.get("tag_name") or "").strip()
+                if not tag.startswith("v") and not tag.startswith("V"):
+                    continue
+                ver  = tag.lstrip("vV")
+                out.append({
+                    "tag":         tag,
+                    "version":     ver,
+                    "prerelease":  bool(rel.get("prerelease", False)),
+                    "publishedAt": rel.get("published_at") or "",
+                    "isCurrent":   bool(local_ver) and local_ver == ver,
+                })
+            out.sort(key=lambda r: _version_tuple(r["version"]), reverse=True)
+            self._json({"ok": True, "localVersion": local_ver, "releases": out})
         except Exception as ex:
             self._json({"ok": False, "error": str(ex)})
 
@@ -1031,19 +1098,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         try:
             channel = str(b.get("channel", "")).strip()
-            if channel not in ("release", "main"):
-                self._err(400, "channel must be 'release' or 'main'")
+            tag     = str(b.get("tag", "")).strip()
+            if not tag and channel not in ("release", "main"):
+                self._err(400, "provide 'channel' ('release'/'main') or an explicit 'tag'")
                 return
+            target  = tag or channel
 
             try:
-                staging_dir = _stage_update(channel)
+                staging_dir = _stage_update(channel=channel or None, tag=tag or None)
             except Exception as ex:
-                daemon._mlog(f"✕ Update staging failed ({channel}): {ex}")
+                daemon._mlog(f"✕ Update staging failed ({target}): {ex}")
                 self._json({"ok": False, "error": str(ex)})
                 return
 
             marker = {
-                "channel":     channel,
+                "channel":     target,
+                "tag":         tag,
                 "stagingDir":  str(staging_dir),
                 "requestedAt": time.time(),
             }
@@ -1055,7 +1125,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": f"Could not write update marker: {ex}"})
                 return
 
-            daemon._mlog(f"✓ Update staged ({channel}) — restarting to apply…")
+            daemon._mlog(f"✓ Update staged ({target}) — restarting to apply…")
             self._json({"ok": True, "message": "Update staged — Maestro is restarting to apply it."})
 
             def _do():
@@ -1075,6 +1145,114 @@ class Handler(http.server.BaseHTTPRequestHandler):
             threading.Thread(target=_do, daemon=True).start()
         finally:
             _update_lock.release()
+
+    # ── Export / Import (full state bundle) ────────────────────────────────────
+    def _api_export(self):
+        """Return the full Maestro state as a JSON bundle: settings + every
+        config entry (SEP rows included). Runtime-only fields (pid, metrics,
+        crash counters) are never exported."""
+        with daemon._lock:
+            snap = list(daemon.entries)
+        entries_out = []
+        for e in snap:
+            entries_out.append({
+                "status":      e.status,
+                "path":        e.path,
+                "name":        e.name,
+                "delay":       e.delay,
+                "autoRestart": e.auto_restart,
+                "keepOpen":    e.keep_open,
+                "launchHidden":e.launch_hidden,
+                "webapps":     list(e.webapps),
+                "updateScript":e.update_script,
+                "sepFile":     e.sep_file,
+                "infoFile":    e.info_file,
+                "openOutside": e.open_outside,
+                "termColor":   e.term_color,
+            })
+        self._json({
+            "app":        "Maestro",
+            "format":     1,
+            "exportedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "version":    _read_local_badge_version(),
+            "settings":   dict(_settings),
+            "entries":    entries_out,
+        })
+
+    def _import_state(self, b: dict):
+        """Replace the full Maestro state with an exported bundle.
+        Kills every running script first; imported entries all start OFF —
+        the user relaunches them explicitly."""
+        if not isinstance(b, dict) or b.get("app") != "Maestro":
+            self._err(400, "not a valid Maestro export file")
+            return
+        raw_entries = b.get("entries")
+        if not isinstance(raw_entries, list):
+            self._err(400, "missing 'entries' list")
+            return
+        new_entries = []
+        for i, d in enumerate(raw_entries):
+            if not isinstance(d, dict):
+                self._err(400, f"entry {i} is not an object")
+                return
+            status = str(d.get("status", "")).strip()
+            path   = str(d.get("path", ""))
+            name   = str(d.get("name", ""))
+            if status == "SEP":
+                new_entries.append(daemon.ProcessEntry(
+                    "SEP", path, name=name,
+                    sep_file=str(d.get("sepFile", "")),
+                    info_file=str(d.get("infoFile", ""))))
+                continue
+            if status not in ("ON", "OFF"):
+                self._err(400, f"entry {i} has unknown status '{status}'")
+                return
+            if not path:
+                self._err(400, f"entry {i} has no path")
+                return
+            wb = d.get("webapps") or []
+            if not isinstance(wb, list):
+                self._err(400, f"entry {i} has invalid webapps")
+                return
+            try:
+                delay = int(d.get("delay", 0) or 0)
+            except (TypeError, ValueError):
+                delay = 0
+            # Entries are always imported stopped (OFF): runtime state is
+            # never transferred, and paths may not exist on this machine.
+            new_entries.append(daemon.ProcessEntry(
+                "OFF", path, delay=delay,
+                auto_restart=bool(d.get("autoRestart", False)),
+                keep_open=bool(d.get("keepOpen", True)),
+                name=name,
+                launch_hidden=bool(d.get("launchHidden", False)),
+                webapps=[str(x) for x in wb],
+                update_script=str(d.get("updateScript", "")),
+                sep_file=str(d.get("sepFile", "")),
+                info_file=str(d.get("infoFile", "")),
+                open_outside=bool(d.get("openOutside", False)),
+                term_color=str(d.get("termColor", "default")),
+            ))
+        raw_settings = b.get("settings") or {}
+        if not isinstance(raw_settings, dict):
+            self._err(400, "'settings' is not an object")
+            return
+        changed = False
+        for k, v in raw_settings.items():
+            if k not in _DEFAULT_SETTINGS:
+                continue   # ignore unknown keys from newer/other builds
+            if _settings.get(k) != v:
+                _settings[k] = v
+                changed = True
+        with daemon._lock:
+            daemon.kill_all()
+            daemon.entries = new_entries
+            daemon.save_config()
+        if isinstance(raw_settings.get("logsRecorder"), bool):
+            daemon._logging_enabled = raw_settings["logsRecorder"]
+        if changed:
+            _write_settings(_DATA_DIR, _settings)
+        self._json({"ok": True, "entriesImported": len(new_entries)})
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────

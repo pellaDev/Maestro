@@ -152,7 +152,7 @@ print(f"{BOLD}  ██║ ╚═╝ ██║██║  ██║█████
 print(f"{DIM}  ╚═╝     ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ {RST}v2.0")
 print()
 print("  Privacy-first process orchestrator — Windows installer")
-print(f"  {DIM}https://github.com/AIdevelopmentPit/Maestro{RST}")
+print(f"  {DIM}https://github.com/pellaDev/Maestro{RST}")
 print(f"  {DIM}Platform: Windows {platform.version()}{RST}")
 print()
 

@@ -82,20 +82,6 @@ if _WIN:
             ('PeakPagefileUsage',            ctypes.c_size_t),
         ]
 
-    class _MSX(ctypes.Structure):
-        """MEMORYSTATUSEX (sysinfoapi.h) — system-wide RAM."""
-        _fields_ = [
-            ('dwLength',                ctypes.wintypes.DWORD),
-            ('dwMemoryLoad',            ctypes.wintypes.DWORD),
-            ('ullTotalPhys',            ctypes.c_uint64),
-            ('ullAvailPhys',            ctypes.c_uint64),
-            ('ullTotalPageFile',        ctypes.c_uint64),
-            ('ullAvailPageFile',        ctypes.c_uint64),
-            ('ullTotalVirtual',         ctypes.c_uint64),
-            ('ullAvailVirtual',         ctypes.c_uint64),
-            ('ullAvailExtendedVirtual', ctypes.c_uint64),
-        ]
-
 # ── Path variables (set by init()) ────────────────────────────────────────────
 _BASE_DIR   = None
 _DATA_DIR   = None
@@ -130,9 +116,6 @@ _logging_enabled = True
 _self_buf        = collections.deque(maxlen=BUF_LINES)
 _self_subs: list = []
 _self_subs_lock  = threading.Lock()
-
-_sys_cpu       = 0.0
-_prev_cpu_stat = None   # platform-specific: (total, idle) on Linux; (idle_t, total_t) on Windows
 
 # Windows bash path cache: Ellipsis = unchecked; None = not found; str = found path
 _bash_win_cache = ...
@@ -533,97 +516,6 @@ def _update_metrics_win(e):
         # after any momentary blip, not just a PID-gone condition).
     finally:
         ctypes.windll.kernel32.CloseHandle(h)
-
-
-def _read_sys_cpu():
-    """Update _sys_cpu global from system-wide CPU delta."""
-    global _sys_cpu, _prev_cpu_stat
-    if _WIN:
-        try:
-            idle = _FILETIME(); kernel = _FILETIME(); user = _FILETIME()
-            ctypes.windll.kernel32.GetSystemTimes(
-                ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
-            )
-            idle_t  = _ft_int(idle)
-            total_t = _ft_int(kernel) + _ft_int(user)
-            if _prev_cpu_stat is not None:
-                pi, pt  = _prev_cpu_stat
-                d_idle  = idle_t  - pi
-                d_total = total_t - pt
-                if d_total > 0:
-                    _sys_cpu = round((1.0 - d_idle / d_total) * 100, 1)
-            _prev_cpu_stat = (idle_t, total_t)
-        except Exception:
-            pass
-        return
-    # Linux: /proc/stat delta
-    try:
-        line  = Path("/proc/stat").read_text().splitlines()[0]
-        vals  = list(map(int, line.split()[1:]))
-        total = sum(vals)
-        idle  = vals[3]
-        if _prev_cpu_stat is None:
-            _prev_cpu_stat = (total, idle)
-            return
-        pt, pi = _prev_cpu_stat
-        dt = total - pt
-        di = idle  - pi
-        _prev_cpu_stat = (total, idle)
-        if dt > 0:
-            _sys_cpu = round((1.0 - di / dt) * 100, 1)
-    except Exception:
-        pass
-
-
-def _read_sys_ram() -> tuple:
-    """Return (used_mb, total_mb) for system RAM."""
-    if _WIN:
-        try:
-            stat = _MSX()
-            stat.dwLength = ctypes.sizeof(stat)
-            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
-            total_mb = stat.ullTotalPhys >> 20
-            avail_mb = stat.ullAvailPhys >> 20
-            return total_mb - avail_mb, total_mb
-        except Exception:
-            return 0, 0
-    # Linux: /proc/meminfo
-    try:
-        info = {}
-        for line in Path("/proc/meminfo").read_text().splitlines():
-            if ':' not in line:
-                continue
-            k, v = line.split(':', 1)
-            try:
-                info[k.strip()] = int(v.split()[0]) // 1024
-            except Exception:
-                pass
-        total = info.get("MemTotal",     0)
-        avail = info.get("MemAvailable", 0)
-        return total - avail, total
-    except Exception:
-        return 0, 0
-
-
-def _read_gpu() -> dict:
-    """AMD GPU stats from Linux sysfs. Returns zeros on Windows or on failure."""
-    if _WIN:
-        return {"gpu": 0, "vramUsed": 0, "vramTotal": 0}
-    try:
-        for card in sorted(Path("/sys/class/drm").iterdir()):
-            if not card.name.startswith("card") or "_" in card.name:
-                continue
-            dev = card / "device"
-            try:
-                gpu = int((dev / "gpu_busy_percent").read_text().strip())
-                vu  = int((dev / "mem_info_vram_used").read_text().strip())  >> 20
-                vt  = int((dev / "mem_info_vram_total").read_text().strip()) >> 20
-                return {"gpu": gpu, "vramUsed": vu, "vramTotal": vt}
-            except (FileNotFoundError, ValueError, PermissionError):
-                continue
-    except Exception:
-        pass
-    return {"gpu": 0, "vramUsed": 0, "vramTotal": 0}
 
 
 # ── Notifications ──────────────────────────────────────────────────────────────
@@ -1146,12 +1038,10 @@ def _watch_existing_pid(e):
 def _metrics_loop():
     """
     Background daemon thread. Runs every 2s:
-      - updates system-wide CPU
       - checks entry path reachability (unreachable state transitions)
       - updates per-process CPU/RAM metrics
     """
     while not _stop.wait(2.0):
-        _read_sys_cpu()
         _check_paths()
         with _lock:
             snap = list(entries)

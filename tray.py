@@ -284,6 +284,7 @@ _DEFAULT_SETTINGS = {
     "autostart":           False,
     "trayPersistent":      True,
     "systemNotifications": True,
+    "autoUpdate":          False,
     "host":                "127.0.0.1",
     "port":                8865,
     "dataDir":             "",
@@ -828,6 +829,42 @@ class MaestroTray:
             self._headless_stop.set()
 
     # ── main.py subprocess lifecycle ───────────────────────────────────────────
+    def _maybe_auto_update(self):
+        """Auto-update hook: if autoUpdate is enabled and the installed version
+        is OLDER than GitHub's latest stable release, stage that release and
+        apply it immediately. Called from _start_main() before main.py launches,
+        so there are no running scripts to save at this point. Best-effort:
+        any failure just logs and continues with a normal startup (worst case
+        ~15s of extra startup delay when GitHub is unreachable)."""
+        if not self._settings.get("autoUpdate", False):
+            return
+        try:
+            import main as maestro_main   # same dir as tray.py (BIN_DIR)
+            token = str(self._settings.get("githubToken", "")).strip()
+            rel   = maestro_main._github_resolve_channel_release("release", token)
+            remote_ver = (rel.get("tag_name") or "").lstrip("vV")
+            if not remote_ver:
+                return
+            local_ver = maestro_main._read_local_badge_version()
+            # Never auto-update blindly: skip when the local version cannot be
+            # read, and do nothing when installed >= latest stable (e.g. a
+            # pre-release build is already newer than the stable channel).
+            if not local_ver or maestro_main._cmp_versions(local_ver, remote_ver) >= 0:
+                return
+            staging_dir = maestro_main._stage_update(channel="release", token=token)
+            marker = {
+                "channel":     "release",
+                "tag":         (rel.get("tag_name") or "").strip(),
+                "stagingDir":  str(staging_dir),
+                "requestedAt": time.time(),
+                "auto":        True,
+            }
+            (DATA_DIR / UPDATE_MARKER).write_text(json.dumps(marker, indent=2))
+            print(f"[tray] Auto-update: v{local_ver} -> v{remote_ver}", file=sys.stderr)
+            self._perform_update(str(staging_dir), "release")   # re-execs; no return on Linux
+        except Exception as ex:
+            print(f"[tray] Auto-update check failed (continuing normal startup): {ex}", file=sys.stderr)
+
     def _start_main(self):
         # Gracefully stop any orphaned main.py from a previous force-close.
         # When tray.py is killed hard, main.py can survive as an orphan on port 8865.
@@ -843,6 +880,9 @@ class MaestroTray:
             pass   # nothing orphaned — proceed normally
 
         self._settings = _load_settings()
+        # Auto-update check (no-op unless enabled in settings): may re-exec
+        # this process and never return.
+        self._maybe_auto_update()
         cmd = [sys.executable, str(MAIN_PY), "--data-dir", str(DATA_DIR)]
         try:
             self._main_proc = subprocess.Popen(
@@ -917,9 +957,8 @@ class MaestroTray:
         itself so a change to tray.py itself also takes effect (not just
         main.py/daemon.py, which a simple main.py-only restart would miss).
 
-        No backup is kept after a successful swap — by design (see
-        MAESTRO_GUIDE.md "Update Maestro" planned-feature notes: automatic
-        backup/rollback was explicitly declined to keep this feature simple).
+        No backup is kept after a successful swap — by design (automatic
+        backup/rollback was deliberately omitted to keep this feature simple).
         The old bin/ is moved aside only transiently, so a failure mid-swap
         can still be recovered from automatically.
 
