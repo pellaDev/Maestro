@@ -1,3 +1,9 @@
+<p align="center">
+  <a href="https://liberapay.com/pellaDev/donate">
+    <img src="https://liberapay.com/assets/widgets/donate.svg" alt="Donate using Liberapay">
+  </a>
+</p>
+
 <h1 align="center">
   <strong><span style="color:#FFD700;">MAESTRO</span></strong>
 </h1>
@@ -406,4 +412,4 @@ Issues and PRs welcome. However, all contributions are governed by the terms des
 
 ## Support
 
-💛 [Support me on GitHub Sponsors](https://github.com/sponsors/apellaman/)
+💛 [Donate on Liberapay](https://liberapay.com/pellaDev/donate)
