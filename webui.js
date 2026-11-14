@@ -1,5 +1,5 @@
 'use strict';
-// Path: /disks/linux/EXT4/ENVIRONMENTS/MaestroStable/webui.js
+// Path: webui.js
 // WebUI tab management — iframe lifecycle, dark placeholder, suspend/resume.
 // Depends on ui.js globals: api, el, setStatus, renderPills,
 //                           updateFooterForActiveTab, pingUntilUp
