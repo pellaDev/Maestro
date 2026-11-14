@@ -65,6 +65,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--txt1);
 .tab.active::after{background:var(--acc1)}
 .tab.tab-web.active::after{background:var(--blu)}
 .tab.tab-drag-over{border-color:var(--acc4);background:var(--bg4)}
+.tab.tab-paused .tab-name{opacity:.55}
 .tab-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
 .tab-dot.run{background:var(--grn)}.tab-dot.stop{background:var(--gry)}.tab-dot.crash{background:var(--red);animation:blink 1s infinite}
 .tab-name{overflow:hidden;text-overflow:ellipsis;max-width:120px}
@@ -117,26 +118,6 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--txt1);
 #lsb-scripts{flex:1;overflow-y:auto;overflow-x:hidden;min-height:60px}
 #lsb-scripts::-webkit-scrollbar{width:6px}
 #lsb-scripts::-webkit-scrollbar-thumb{background:var(--acc3);border-radius:3px}
-
-/* File tree resize divider */
-#lsb-divider{height:5px;background:var(--brd);cursor:row-resize;flex-shrink:0;
-  display:flex;align-items:center;justify-content:center}
-#lsb-divider::after{content:'';display:block;width:30px;height:2px;background:var(--acc3);border-radius:2px}
-#lsb-divider:hover{background:var(--acc3)}
-#lsb-tree-wrap{display:flex;flex-direction:column;border-top:1px solid var(--brd);
-  overflow:hidden;height:200px;min-height:60px}
-#lsb-tree-header{padding:5px 7px;font-size:10px;color:var(--txt3);text-transform:uppercase;
-  letter-spacing:.8px;flex-shrink:0;display:flex;align-items:center;gap:6px}
-#lsb-tree-path{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-  font-size:10px;color:var(--acc4)}
-#lsb-tree{flex:1;overflow-y:auto;overflow-x:hidden;padding:2px 0}
-#lsb-tree::-webkit-scrollbar{width:6px}
-#lsb-tree::-webkit-scrollbar-thumb{background:var(--acc3);border-radius:3px}
-.tree-item{display:flex;align-items:center;gap:5px;padding:3px 7px;
-  cursor:pointer;font-size:11px;transition:background .1s;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.tree-item:hover{background:var(--bg4)}.tree-item.tdir{color:var(--acc4)}.tree-item.tup{color:var(--txt3)}
-
 
 #lsb-bottom{border-top:1px solid var(--brd);padding:7px;display:flex;flex-direction:column;gap:5px;flex-shrink:0}
 .sb-main-row{display:flex;gap:5px;align-items:stretch}
@@ -215,7 +196,6 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--txt1);
   border-color:var(--hover-brd);box-shadow:0 0 10px rgba(232,200,122,.2)}
 /* wide panel: span 2 via inline style (grid-column/row:span 2) */
 .tp.pdrop{border-color:var(--acc1);border-style:dashed}
-.tp.tp-exp{position:absolute;inset:0;z-index:10;background:var(--bg2)}
 .tp-hdr{display:flex;align-items:center;gap:5px;padding:4px 7px;background:var(--bg3);
   border-bottom:1px solid var(--brd);cursor:grab;flex-shrink:0;user-select:none}
 .tp-hdr.nodrag{cursor:default}
@@ -234,28 +214,6 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--txt1);
 .fv-textarea{flex:1;background:var(--bg0);border:none;color:var(--txt1);
   font-family:inherit;font-size:12px;line-height:1.5;padding:8px;
   resize:none;outline:none;min-height:0;width:100%}
-
-/* ── Explorer panel ── */
-.tp-explorer{flex:1;display:grid;grid-template-columns:1fr 1fr;overflow:hidden;min-height:0}
-.exp-pane{display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--brd)}
-.exp-pane:last-child{border-right:none}
-.exp-header{padding:5px 8px;font-size:10px;color:var(--txt3);border-bottom:1px solid var(--brd);
-  text-transform:uppercase;letter-spacing:.6px;flex-shrink:0;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.exp-list{flex:1;overflow-y:auto;padding:2px 0}
-.exp-list::-webkit-scrollbar{width:6px}
-.exp-list::-webkit-scrollbar-thumb{background:var(--acc3);border-radius:3px}
-.exp-item{display:flex;align-items:center;gap:5px;padding:4px 8px;cursor:pointer;
-  font-size:11px;transition:background .1s}
-.exp-item:hover,.exp-item.tsel{background:var(--bg4)}
-.exp-item.tdir{color:var(--acc4)}.exp-item.tfile{color:var(--txt2)}.exp-item.tup{color:var(--txt3)}
-.exp-file-wrap{flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:0}
-.exp-file-ta{flex:1;background:var(--bg0);border:none;color:var(--txt2);
-  font-family:inherit;font-size:11.5px;line-height:1.5;padding:8px;resize:none;outline:none;min-height:0}
-.exp-toolbar{display:flex;gap:5px;padding:5px 7px;border-top:1px solid var(--brd);flex-shrink:0}
-.exp-btn{background:var(--bg2);border:1px solid var(--brd);color:var(--txt2);
-  padding:3px 8px;border-radius:2px;cursor:pointer;font-family:inherit;font-size:11px;transition:all .1s}
-.exp-btn:hover{background:var(--bg4);color:var(--txt1);border-color:var(--acc3)}
 
 /* ── RSB ── */
 #rsb{position:fixed;top:0;right:0;bottom:0;width:var(--rsbar);
@@ -303,18 +261,6 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--txt1);
 .wb-rm{position:absolute;top:4px;right:4px;background:none;border:none;
   color:var(--txt3);cursor:pointer;font-size:13px;line-height:1}
 .wb-rm:hover{color:var(--red)}
-.fb-box{border:1px solid var(--brd);border-radius:2px;background:var(--bg0);
-  max-height:600px;overflow-y:auto}
-.fb-box::-webkit-scrollbar{width:6px}
-.fb-box::-webkit-scrollbar-thumb{background:var(--acc3);border-radius:3px}
-.fb-path{font-size:10px;color:var(--txt3);padding:4px 6px;
-  border-bottom:1px solid var(--brd);word-break:break-all}
-.fb-item{padding:5px 9px;cursor:pointer;font-size:12px;
-  display:flex;align-items:center;gap:5px;transition:background .1s}
-.fb-item:hover{background:var(--bg4)}
-.fb-item.fdir{color:var(--acc4)}.fb-item.ffile{color:var(--txt1)}
-.fb-item.fup{color:var(--txt3)}.fb-item.fmsg{color:var(--txt3);cursor:default;font-size:11px}
-
 /* Colour swatches */
 .color-swatches{display:flex;gap:7px;flex-wrap:wrap;padding:4px 0}
 .color-swatch{width:28px;height:28px;border-radius:4px;cursor:pointer;
@@ -334,6 +280,10 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--txt1);
 #ftr-tip{display:none;font-size:11px;color:var(--txt2);text-align:center}
 #ftr-tip.show{display:block}
 #ftr-quote.hide{display:none}
+/* Tab-keepalive / wake-lock status dot; its tooltip (data-tip) is filled by ui.js */
+#ftr-ka{flex-shrink:0;font-size:10px;line-height:1;cursor:default;color:var(--gry)}
+#ftr-ka.ok{color:var(--grn)}
+#ftr-ka.warn{color:var(--ylw)}
 #ftr-status{flex-shrink:0;max-width:50%;font-size:11px;color:var(--grn);
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 /* Full-footer overlay for connection-state notifications (stale / reconnecting /
@@ -400,13 +350,6 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--txt1);
       <button class="tbtn" id="tb-settings" data-tip="Open settings" style="font-size:15px">⚙</button>
     </div>
     <div id="lsb-scripts"></div>
-    <div id="lsb-divider" data-tip="Drag to resize file tree"></div>
-    <div id="lsb-tree-wrap">
-      <div id="lsb-tree-header">
-        <span>📁</span><span id="lsb-tree-path">File tree</span>
-      </div>
-      <div id="lsb-tree"></div>
-    </div>
     <div id="lsb-bottom">
       <div class="sb-main-row">
         <button class="action-btn" id="btn-launch-fav" data-tip="Launch all favourite scripts">★ LAUNCH</button>
@@ -428,6 +371,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--txt1);
         <div id="ftr-url"></div>
         <div id="ftr-tip"></div>
       </div>
+      <span id="ftr-ka" data-tip="Tab keepalive">●</span>
       <span id="ftr-status"></span>
     </div>
     <div id="loadbar"><div id="loadfill"></div></div>
@@ -444,7 +388,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--txt1);
 <div id="settings-backdrop">
   <div id="settings-modal">
     <div id="settings-modal-hdr">
-      <span>⚙ Settings <span class="ver">v2.4</span></span>
+      <span>⚙ Settings <span class="ver">v2.5</span></span>
       <button id="settings-modal-close">✕</button>
     </div>
     <div id="settings-modal-body">

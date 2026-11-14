@@ -18,7 +18,7 @@ Cross-platform: Linux + Windows via ctypes, zero external dependencies.
 main.py owns HTTP routing and serves UI files.
 daemon.py owns all process state.
 """
-import collections, json, os, queue, re, shutil
+import codecs, collections, json, locale, os, queue, re, shutil
 import signal, subprocess, sys, tempfile, threading, time, traceback, uuid
 from pathlib import Path
 
@@ -238,6 +238,7 @@ class ProcessEntry:
         self.subs_lock = threading.Lock()
         self.log_buf   = collections.deque(maxlen=BUF_LINES)
         self.subs      = []               # list[queue.Queue] — live SSE clients
+        self.partial   = None             # in-progress line ('\r' progress output), guarded by subs_lock
         self.metrics   = {"cpu": 0.0, "ram": 0}
         self._cpu_prev = None             # platform-specific CPU delta state
 
@@ -659,22 +660,33 @@ def _run_in_external_terminal_win(e, script_path: str, label: str):
     Requires bash (WSL or Git Bash) — logs an error and returns None if absent.
     _kill_ext(e) is assumed to have already been called by the caller.
     """
-    bash = _get_bash_win()
-    if not bash:
-        _append_log(e,
-            "[MAESTRO] ✕ No bash found — install WSL or Git Bash to launch scripts")
-        _mlog(f"[{e.display_name()}] ✕ No bash found (WSL / Git Bash required)")
-        return None
+    cwd = str(Path(script_path).parent)
+    if Path(script_path).suffix.lower() in (".exe", ".com", ".bat", ".cmd", ".ps1", ".py", ".jar"):
+        # Native Windows file: no bash needed, run it directly in a console window
+        argv, _x, err = _resolve_command(script_path)
+        if err:
+            _append_log(e, f"[MAESTRO] ✕ {label} failed: {err}")
+            return None
+        candidates = [
+            (['wt.exe', '-d', cwd] + argv, {}),
+            (argv, {'cwd': cwd, 'creationflags': _CF_NEW_CONSOLE}),
+        ]
+    else:
+        bash = _get_bash_win()
+        if not bash:
+            _append_log(e,
+                "[MAESTRO] ✕ No bash found — install WSL or Git Bash to launch scripts")
+            _mlog(f"[{e.display_name()}] ✕ No bash found (WSL / Git Bash required)")
+            return None
 
-    tail    = 'echo ""; echo "--- Done (exit: $?) ---"; read -p "Press Enter to close..."'
-    cmd_str = f'bash "{script_path}"; {tail}'
-    cwd     = str(Path(script_path).parent)
+        tail    = 'echo ""; echo "--- Done (exit: $?) ---"; read -p "Press Enter to close..."'
+        cmd_str = f'bash "{script_path}"; {tail}'
 
-    # Candidates: Windows Terminal (best UX), then bash with a new console window
-    candidates = [
-        (['wt.exe', '-d', cwd, bash, '-c', cmd_str], {}),
-        ([bash, '-c', cmd_str], {'cwd': cwd, 'creationflags': _CF_NEW_CONSOLE}),
-    ]
+        # Candidates: Windows Terminal (best UX), then bash with a new console window
+        candidates = [
+            (['wt.exe', '-d', cwd, bash, '-c', cmd_str], {}),
+            ([bash, '-c', cmd_str], {'cwd': cwd, 'creationflags': _CF_NEW_CONSOLE}),
+        ]
 
     for cmd, kwargs in candidates:
         try:
@@ -715,8 +727,15 @@ def _run_in_external_terminal(e, script_path: str, label: str = "Launch"):
         return _run_in_external_terminal_win(e, script_path, label)
 
     # Linux: try emulators in order
+    argv, needs_exec, err = _resolve_command(script_path)
+    if err:
+        _append_log(e, f"[MAESTRO] ✕ {label} failed: {err}")
+        _mlog(f"[{e.display_name()}] ✕ {label} failed: {err}")
+        return None
+    if needs_exec:
+        _ensure_exec(script_path)
     tail    = 'echo ""; echo "--- Done (exit: $?) ---"; read -p "Press Enter to close..."'
-    cmd_str = f'bash "{script_path}"; {tail}'
+    cmd_str = f'{" ".join(_shq(a) for a in argv)}; {tail}'
     cwd     = str(Path(script_path).parent)
     for builder in _EXT_CANDIDATES:
         cmd, kwargs = builder(cmd_str, cwd)
@@ -746,6 +765,80 @@ def _run_in_external_terminal(e, script_path: str, label: str = "Launch"):
     )
     _mlog(f"[{e.display_name()}] ✕ No terminal emulator found")
     return None
+
+
+# ── Launchable file types ─────────────────────────────────────────────────────
+# Anything that can be added as an entry besides plain shell scripts. Used by the
+# file browser filter (main.py) and by _resolve_command() below.
+LAUNCHABLE_EXTS = {
+    ".sh", ".bash",                    # shell scripts (bash)
+    ".appimage", ".run", ".bin",       # Linux executables
+    ".py", ".jar",                     # interpreters
+    ".exe", ".com", ".bat", ".cmd", ".ps1",   # Windows
+}
+
+
+def _is_elf(path: str) -> bool:
+    """True if the file starts with the ELF magic (native Linux executable, AppImage, ...)."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
+def _resolve_command(path: str):
+    """
+    Decide how to run an entry from its file type.
+    Returns (argv, needs_exec, error): `needs_exec` means the file is launched
+    directly and must have the executable bit (see _ensure_exec); `error` is a
+    human-readable reason when the file cannot be run on this platform.
+    Backward compatible: anything unrecognised still runs through bash, as every
+    entry did before this resolver existed.
+    """
+    ext = Path(path).suffix.lower()
+    if _WIN:
+        if ext in (".exe", ".com"):  return [path], False, None
+        if ext in (".bat", ".cmd"):  return ["cmd", "/c", path], False, None
+        if ext == ".ps1":
+            return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path], False, None
+        if ext == ".py":             return [sys.executable, path], False, None
+        if ext == ".jar":            return ["java", "-jar", path], False, None
+        if ext == ".appimage":       return None, False, "AppImage files only run on Linux"
+        bash = _get_bash_win()
+        if not bash:
+            return None, False, "bash not found (install WSL or Git Bash to run .sh scripts)"
+        return [bash, path], False, None
+    # Linux
+    if ext == ".py":
+        return [sys.executable, path], False, None
+    if ext == ".jar":
+        java = shutil.which("java")
+        return ([java, "-jar", path], False, None) if java else (None, False, "java not found in PATH")
+    if ext in (".exe", ".com"):
+        wine = shutil.which("wine")
+        return ([wine, path], False, None) if wine else (None, False, "Windows executable: wine is not installed")
+    if ext in (".bat", ".cmd", ".ps1"):
+        return None, False, f"{ext} files only run on Windows"
+    if _is_elf(path):                       # AppImage, .run, .bin, extension-less binaries
+        return [path], True, None
+    return ["bash", path], False, None
+
+
+def _ensure_exec(path: str):
+    """Make sure `path` has the executable bit (downloaded AppImages usually don't). Returns (ok, note)."""
+    if os.access(path, os.X_OK):
+        return True, ""
+    try:
+        os.chmod(path, os.stat(path).st_mode | 0o100)   # u+x
+        return True, "File was not executable — applied chmod u+x"
+    except OSError as ex:
+        return False, str(ex)
+
+
+def _shq(arg: str) -> str:
+    """Double-quote one argument for the 'bash -c' strings of the external terminals."""
+    return '"' + arg.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`") + '"'
 
 
 # ── Process management ─────────────────────────────────────────────────────────
@@ -805,30 +898,34 @@ def launch(idx: int, *, _from_restart: bool = False):
         _launch_external(e, gen)
         return
 
-    # Resolve bash and build platform-specific Popen kwargs
-    if _WIN:
-        bash = _get_bash_win()
-        if not bash:
-            _mlog_event(e,
-                "[MAESTRO] ✕ Launch failed — bash not found (install WSL or Git Bash)")
+    # Resolve the command from the file type (.sh, .AppImage, .exe, ...)
+    proc_cmd, needs_exec, err = _resolve_command(e.path)
+    if err:
+        _mlog_event(e, f"[MAESTRO] ✕ Launch failed: {err}")
+        return
+    if needs_exec:
+        ok, note = _ensure_exec(e.path)
+        if not ok:
+            _mlog_event(e, f"[MAESTRO] ✕ Launch failed: not executable and chmod failed ({note})")
             return
-        proc_cmd = [bash, e.path]
+        if note:
+            _append_log(e, f"[MAESTRO] {note}")
+
+    # Platform-specific Popen kwargs
+    if _WIN:
         proc_kw  = dict(
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
-            text=True, bufsize=1,
+            bufsize=0,   # raw bytes: '\r' must reach _pump_output untouched
             cwd=str(Path(e.path).parent),
-            errors='replace',
             creationflags=_CF_NO_WINDOW,   # suppress console flash on Windows
         )
     else:
-        proc_cmd = ['bash', e.path]
         proc_kw  = dict(
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, start_new_session=True,
-            text=True, bufsize=1,
+            bufsize=0,   # raw bytes: '\r' must reach _pump_output untouched
             cwd=str(Path(e.path).parent),
-            errors='replace',
         )
 
     try:
@@ -852,6 +949,7 @@ def launch(idx: int, *, _from_restart: bool = False):
         e.pid  = proc.pid
         save_config()
 
+    _set_partial(e, "")
     _append_log(e, f"[MAESTRO] ▶ Started — PID {proc.pid}")
     _mlog(f"[{e.display_name()}] ▶ Started — PID {proc.pid}")
     threading.Thread(target=_reader,  args=(e, gen), daemon=True).start()
@@ -871,6 +969,95 @@ def _launch_external(e, gen: int):
     threading.Thread(target=_monitor_external, args=(e, proc, gen), daemon=True).start()
 
 
+# ── Terminal-style line assembly ───────────────────────────────────────────────
+# A real terminal treats '\n' as "line finished" and '\r' as "go back to column 0", so
+# programs that print progress ("x1", "x2", "x3"...) with '\r' rewrite ONE line. Python's
+# text mode used to turn every '\r' into '\n', which put each update on a new line.
+# Here a line that is still being rewritten lives in `e.partial` (published as the SSE
+# event "partial", replaced by the next update) and only becomes a normal log line when
+# it is finished by '\n' (or when the process ends). Cursor-up redraws of several lines
+# (docker/yarn style multi-bar output) are NOT emulated.
+_ERASE_LINE = re.compile(r"\x1b\[(?:2K|[01]?G)")   # erase line / cursor to column 0 → behave like '\r'
+_INCOMPLETE_ESC = re.compile(r"\x1b(?:\[[0-9;?]*)?$")   # an escape sequence cut by the chunk boundary
+
+
+class _LineState:
+    __slots__ = ("line", "cr", "pending")
+
+    def __init__(self):
+        self.line    = ""      # visible content of the line being assembled
+        self.cr      = False   # a '\r' was seen: the next text overwrites `line`
+        self.pending = ""      # incomplete escape sequence carried over to the next chunk
+
+
+def _set_partial(e, text: str):
+    """Publish the current in-progress line ("" = none). Idempotent; guarded by subs_lock."""
+    with e.subs_lock:
+        if (e.partial or "") == text:
+            return
+        e.partial = text or None
+        dead = []
+        for q in e.subs:
+            try:    q.put_nowait(("partial", text))
+            except queue.Full: dead.append(q)
+        for q in dead:
+            e.subs.remove(q)
+
+
+def _commit_line(e, st: _LineState):
+    """The line is finished: drop the in-progress copy and log it once."""
+    line, st.line, st.cr = st.line, "", False
+    if e.partial:
+        _set_partial(e, "")
+    _append_log(e, line)
+
+
+def _feed_output(e, st: _LineState, text: str, final: bool = False):
+    """Feed decoded output into the line assembler of entry e."""
+    data = st.pending + text
+    st.pending = ""
+    if not final:
+        m = _INCOMPLETE_ESC.search(data)
+        if m:
+            st.pending, data = data[m.start():], data[:m.start()]
+    data = strip_ansi(_ERASE_LINE.sub("\r", data))
+    saw_cr = False
+    for tok in re.split(r"([\r\n])", data):
+        if tok == "\n":
+            _commit_line(e, st)
+            saw_cr = False
+        elif tok == "\r":
+            st.cr = saw_cr = True
+        elif tok:
+            if st.cr:
+                st.line, st.cr = tok, False      # overwrite the line
+            else:
+                st.line += tok
+    # Show a line that is being rewritten live. Ordinary partial lines (no '\r' involved)
+    # keep the old behaviour: they appear when the newline arrives.
+    if st.line and (saw_cr or st.cr or e.partial):
+        _set_partial(e, st.line)
+
+
+def _pump_output(e, gen: int, proc):
+    """Read the process pipe until EOF and turn it into log lines / in-progress updates."""
+    enc = (locale.getpreferredencoding(False) or "utf-8") if _WIN else "utf-8"
+    dec = codecs.getincrementaldecoder(enc)(errors="replace")
+    st  = _LineState()
+    while True:
+        chunk = proc.stdout.read(8192)       # returns as soon as some bytes are available
+        if not chunk:
+            break
+        if e.generation != gen:
+            return
+        _feed_output(e, st, dec.decode(chunk))
+    if e.generation != gen:
+        return
+    _feed_output(e, st, dec.decode(b"", final=True), final=True)
+    if st.line or e.partial:                  # unfinished last line: keep it as a normal line
+        _commit_line(e, st)
+
+
 def _reader(e, gen: int):
     """Read stdout/stderr from the internal subprocess and push lines to SSE."""
     # Fix #14: snapshot e.proc under the lock rather than reading the
@@ -880,10 +1067,7 @@ def _reader(e, gen: int):
     if proc is None:
         return
     try:
-        for line in proc.stdout:
-            if e.generation != gen:
-                break
-            _append_log(e, line.rstrip("\n"))
+        _pump_output(e, gen, proc)
     except Exception:
         pass
 
@@ -906,6 +1090,14 @@ def _monitor(e, gen: int):
     if e.manually_killed:
         _append_log(e, f"[MAESTRO] ■ Stopped (exit {rc})")
         _mlog(f"[{e.display_name()}] ■ Stopped (exit {rc})")
+        return
+    if rc == 0:
+        # A clean exit is not a crash: the program simply finished (utilities,
+        # installers, an AppImage the user quit). No crash styling, no auto-restart.
+        _mlog_event(e, "[MAESTRO] ■ Finished (exit 0)")
+        _pub(e, "finished", "0")
+        if not e.keep_open:
+            _pub(e, "close_panel", "")
         return
     e.crash = True
     _mlog_event(e, f"[MAESTRO] ⚠ Crashed — exit {rc}")
@@ -942,8 +1134,9 @@ def _monitor_external(e, proc, gen: int):
     rc = proc.returncode if proc.returncode is not None else "?"
     _append_log(e, f"[MAESTRO] ■ External terminal closed (exit {rc})")
     _mlog(f"[{e.display_name()}] ■ External closed (exit {rc})")
-    # Always fire crash event so the frontend poll triggers and sidebar updates
-    _pub(e, "crash", str(rc))
+    # Always fire an event so the frontend poll triggers and the sidebar updates;
+    # exit 0 is a normal finish, anything else keeps the crash styling.
+    _pub(e, "finished" if rc == 0 else "crash", str(rc))
     if not e.keep_open:
         _pub(e, "close_panel", "")
 

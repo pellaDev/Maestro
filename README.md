@@ -46,19 +46,19 @@ Everything runs locally. Nothing leaves your machine (aside from the update chec
 ## Features
 
 - **Process management** — launch, kill, restart scripts; auto-restart on crash; configurable launch delay
-- **Live log streaming** — Server-Sent Events (SSE), no polling, no WebSocket dependency
+- **Live log streaming** — one multiplexed Server-Sent Events (SSE) stream for all panels, no polling, no WebSocket dependency; `\r`-rewritten progress lines (install/download bars) render live
 - **System tray** — GTK StatusIcon / AppIndicator3 (Linux) or Win32 (Windows); health check every 5s
 - **Desktop notifications** — `notify-send` on Linux; Win32 balloon on Windows; fired on start, crash, restart, update, script not found
-- **WebApp tabs** — iframe tabs in the header bar, ping-gated load, suspend/resume, drag-to-reorder
+- **WebApp tabs** — iframe tabs in the header bar, suspend/resume, drag-to-reorder; lazy loading — inactive webapps auto-suspend after `webAppAutoSuspendMin` minutes and wake on click (optional background tab keep-alive keeps them loaded)
 - **Terminal colour themes** — Default, Navy, Forest, Plum, Teal, Ember — set per script
 - **Wide panel toggle** — any terminal panel can span 2 grid columns
 - **Open outside** — launch a script in an OS terminal emulator instead of the internal panel
 - **Update scripts** — per-entry `update.sh` support, run in external terminal
 - **Info files** — read-only `.md` panel per script
 - **Separator rows** — group scripts with labelled dividers; optional attached text file
-- **File tree** — sidebar tree for quick navigation; full file explorer panel
+- **Native file picker** — adding scripts or attaching files opens the OS dialog (zenity or kdialog on Linux); last-used directory remembered
 - **Unreachable detection** — scripts with missing files shown as unreachable; notified once per transition
-- **Settings modal** — toggle file explorer, logs recorder, autostart, open browser at launch, host/port, GitHub token
+- **Settings modal** — toggle background tab keep-alive, screen wake lock, webapp auto-suspend, logs recorder, autostart, open browser at launch, host/port, GitHub token
 - **Update Maestro** — check for and install updates from either the Latest or Pre-release channel, directly from the Settings modal — no manual reinstall needed. Also: **CHECK ALL VERSIONS** lists every installable release so you can install any specific tag (rollback included), an optional **Auto-update** toggle that installs a newer Latest at startup, and **Backup / Restore** to export/import your full state (settings + scripts list)
 - **Single-instance lock** — platform temp dir `/MaestroWeb.pid`
 - **Atomic config writes** — `config.txt` and `settings.json` written via `tempfile + shutil.move`
@@ -351,7 +351,9 @@ Located in `data/settings.json`. Edited via the ⚙ Settings modal in the UI.
 
 | Key | Default | Description |
 |---|---|---|
-| `fileExplorer` | `false` | Show/hide sidebar file tree and explorer panel |
+| `tabKeepalive` | `true` | Keep inactive webapp tabs loaded; no auto-suspend |
+| `screenWakeLock` | `true` | Screen wake lock while the UI is open; re-acquired when the tab becomes visible |
+| `webAppAutoSuspendMin` | `10` | Minutes of inactivity after which an inactive webapp tab suspends itself (page blanked, no requests until click/▶) |
 | `logsRecorder` | `false` | Write all logs to `data/logs/maestro.log` |
 | `openBrowserAtLaunch` | `false` | Auto-open browser 3s after start |
 | `autostart` | `false` | Create/remove autostart entry (Linux `.desktop` / Windows registry) |

@@ -2,7 +2,6 @@
 // Path: ui.js
 
 const MAESTRO_UID  = '__maestro__';
-const EXPLORER_UID = '__explorer__';
 const MAX_PANELS   = 32;
 
 const TERM_COLORS = {
@@ -15,12 +14,23 @@ const TERM_COLORS = {
 };
 
 // ── State ─────────────────────────────────────────────────────────────────────
-let entries=[],selIdx=-1,panels=[],activeTab=null,sseConns={},dragSrc=null,_dragTabUid=null;
+let entries=[],selIdx=-1,panels=[],activeTab=null,dragSrc=null,_dragTabUid=null;
 let _prevHash='',_loggingEnabled=true;
 let _settings={};
-let _treeCurrentPath=null,_fbPath=null,_explorerPath=null;
 let _pageVisible=!document.hidden;
-const _tabReady=new Set();
+const _seenTabs=new Set();   // webapp tab uids whose process is running and already handled by renderPills (lazy-tab bookkeeping)
+
+// ── Log stream state (single multiplexed SSE, see connectLogStream) ────────────
+// ONE EventSource (/api/logs-all) carries the logs of every entry. Lines are also
+// kept client-side per uid so a panel opened later can be filled instantly.
+const LOG_BUF_MAX    = 1000;   // lines kept per uid (matches the server's BUF_LINES)
+const LOG_STALE_MS   = 15000;  // no event (log/ping) for this long = stream considered dead
+const LOG_MIN_RETRY  = 3000;   // never reconnect the stream more often than this
+let _logMux      = null;       // the single EventSource
+let _lastLogMsg  = Date.now(); // timestamp of the last event received on it
+let _logConnAt   = 0;          // timestamp of the last connectLogStream() call
+const _logBuf    = {};         // uid -> [{t:line, c:cssClass}]
+const _logPartial= {};         // uid -> text of the line being rewritten with '\r' (progress output), if any
 
 // ── Stale connection watchdog state ─────────────────────────────────────────────
 // Chromium (and Chromium-based browsers like Brave) throttles or pauses timers
@@ -44,11 +54,14 @@ const API_TIMEOUT_MS = 6000;   // hard ceiling for every api() fetch, via AbortS
 const FAST_TRIES     = 4;      // quick attempts right after staleness is detected
 const FAST_GAP_MS    = 1500;   // gap between fast attempts
 const SLOW_RETRY_MS  = 15000;  // gap between attempts once in the persistent slow phase
+const NOTIFY_AFTER_MS= 30000;  // OS notification only for interruptions at least this long
+const QUICK_PROBE_MS = 2500;   // silent first attempt before any overlay is shown
 let _lastPollOk = Date.now();    // timestamp of the last successful /api/state response
 let _lastPollNetErr = false;     // true = last poll failed with a real fetch error; false = just stale (throttled timer)
 let _staleActive = false;        // guards against overlapping reconnect attempts
 let _staleNotified = false;      // guards against spamming an OS notification on every slow-retry attempt
 let _reconnectTimer = null;      // setTimeout id for the current pending reconnect attempt
+let _staleStartedAt = 0;         // when the current interruption started
 
 let _widePanels={};
 try{ _widePanels=JSON.parse(localStorage.getItem('tpw')||'{}'); }catch{}
@@ -59,59 +72,120 @@ try{ _tabOrder=JSON.parse(localStorage.getItem('mto')||'[]'); }catch{}
 function _saveTabOrder(){ try{localStorage.setItem('mto',JSON.stringify(_tabOrder));}catch{} }
 
 function _savePanels(){ try{sessionStorage.setItem('mp',JSON.stringify(panels));}catch{} }
-function _loadPanels(){ try{const p=sessionStorage.getItem('mp');if(p)panels=JSON.parse(p);}catch{} }
+function _loadPanels(){ try{const p=sessionStorage.getItem('mp');if(p)panels=JSON.parse(p).filter(u=>u!=='__explorer__');}catch{} }  // drop the removed explorer panel from old sessions
 _loadPanels();
 
 document.addEventListener('visibilitychange',()=>{
   _pageVisible=!document.hidden;
-  if(_pageVisible){ _forceReconnectAllSSE(); poll(); _checkStale(); }
+  if(_pageVisible){ _ensureLogStream(false); poll(); _checkStale(); }
 });
 
-// ── Background-tab keepalive (silent audio) ──────────────────────────────────
-// Root-cause mitigation for the stale-connection problem the watchdog above
-// works around: Chrome (and Chromium-based browsers) aggressively throttles
-// or fully freezes JS timers in background/minimized tabs, which is what
-// stalls poll() and lets SSE connections go stale in the first place. Tabs
-// that are actively producing audio are exempted from the most aggressive
-// throttling tiers — the same mechanism many "always responsive" webapps
-// (chat/messaging apps, etc.) rely on, without needing WebSockets or a
-// Service Worker. A near-silent, inaudible oscillator is enough to get the
-// exemption without making any actual sound.
-//
-// Zero network calls, zero new attack surface — 100% client-side, no data
-// involved. Does NOT survive an actual OS-level system sleep/suspend (lid
-// closed, etc.) — nothing in JS can prevent that, this only helps with
-// ordinary background-tab throttling while the machine itself stays awake.
-//
-// Started on the user's first interaction with the page (click/key/touch) —
-// required because browsers block audio autoplay without a prior gesture.
-let _keepaliveCtx = null;
-function _startKeepaliveAudio(){
-  if(_keepaliveCtx) return; // already running
-  try{
-    const AC = window.AudioContext || window.webkitAudioContext;
-    if(!AC) return; // unsupported browser — not critical, just skip
-    _keepaliveCtx = new AC();
-    const osc  = _keepaliveCtx.createOscillator();
-    const gain = _keepaliveCtx.createGain();
-    gain.gain.value = 0.0001;    // effectively silent — non-zero on purpose,
-                                  // to avoid any "no audible output" auto-
-                                  // suspend heuristic some browsers apply
-    osc.frequency.value = 20000; // also outside normal human hearing range
-    osc.connect(gain).connect(_keepaliveCtx.destination);
-    osc.start();
-  }catch(e){
-    _keepaliveCtx = null; // feature-detection failed at runtime — just skip
-  }
+// ── Tab-alive: background keepalive (silent audio) + screen wake lock ─────────
+// Chromium freezes a hidden tab after ~5 min (JS, timers and sockets all stop);
+// an audio-playing tab is exempt, which is what the near-silent oscillator below
+// is for (S1). Browsers refuse to START audio before a user gesture, so the
+// context is created at load and resumed on the first click/key/touch, and
+// re-armed on pageshow/focus/visibilitychange. Nothing in JS survives a real OS
+// sleep, and no in-page trick can keep a frozen tab running — the wake lock (S3)
+// prevents the machine from idling to sleep WHILE the tab is visible; the browser
+// releases it automatically when the tab hides, so it is re-requested on return.
+// Both behaviours are user-controlled (Settings: tabKeepalive / screenWakeLock)
+// and their state is shown by the dot in the footer (#ftr-ka).
+let _kaCtx=null,_kaOsc=null,_kaWanted=false,_kaHinted=false;
+let _wlSentinel=null,_wlWanted=false,_wlPending=false;
+let _episodes=[];                       // today's connection interruptions (see _recordEpisode)
+try{ _episodes=JSON.parse(localStorage.getItem('mep')||'[]'); }catch{}
+
+function _kaState(){
+  if(!_kaWanted) return 'off';
+  if(!(window.AudioContext||window.webkitAudioContext)) return 'unsupported';
+  return (_kaCtx&&_kaCtx.state==='running')?'active':'pending';
 }
-['click','keydown','touchstart'].forEach(ev=>
-  document.addEventListener(ev,_startKeepaliveAudio,{once:true})
-);
-// Resume if the browser auto-suspended it for any reason (e.g. right after a
-// system sleep/resume cycle) — cheap no-op if it's already running.
-document.addEventListener('visibilitychange',()=>{
-  if(_keepaliveCtx && _keepaliveCtx.state==='suspended') _keepaliveCtx.resume().catch(()=>{});
-});
+function _kaStart(){
+  if(!_kaWanted) return;
+  if(_kaCtx&&_kaCtx.state==='running') return;   // hot path: key/click listeners call this constantly
+  try{
+    const AC=window.AudioContext||window.webkitAudioContext;
+    if(!AC){ _updateKaIndicator(); return; }
+    if(!_kaCtx){
+      _kaCtx=new AC();
+      _kaCtx.onstatechange=_updateKaIndicator;
+      const osc=_kaCtx.createOscillator(),gain=_kaCtx.createGain();
+      gain.gain.value=0.0001;     // effectively silent, non-zero on purpose: avoids any
+                                  // "no audible output" auto-suspend heuristic
+      osc.frequency.value=20000;  // also outside the normal hearing range
+      osc.connect(gain).connect(_kaCtx.destination);
+      osc.start();_kaOsc=osc;
+    }
+    if(_kaCtx.state==='suspended') _kaCtx.resume().catch(()=>{});
+  }catch(e){ _kaCtx=null; _kaOsc=null; }
+  _updateKaIndicator();
+}
+function _kaStop(){
+  try{ _kaOsc&&_kaOsc.stop(); }catch{}
+  try{ _kaCtx&&_kaCtx.close(); }catch{}
+  _kaCtx=null;_kaOsc=null;_updateKaIndicator();
+}
+
+async function _wlAcquire(){
+  if(!_wlWanted||_wlSentinel||_wlPending||document.hidden) return;
+  if(!('wakeLock' in navigator)) return;          // unsupported, or not a secure context
+  _wlPending=true;
+  try{
+    const sent=await navigator.wakeLock.request('screen');
+    _wlSentinel=sent;
+    sent.addEventListener('release',()=>{ if(_wlSentinel===sent) _wlSentinel=null; _updateKaIndicator(); });
+  }catch(e){ /* refused (e.g. battery saver): retried on the next visibility change */ }
+  _wlPending=false;
+  _updateKaIndicator();
+}
+function _wlRelease(){
+  const sent=_wlSentinel;_wlSentinel=null;
+  if(sent) sent.release().catch(()=>{});
+  _updateKaIndicator();
+}
+
+function _episodeSummary(){
+  const day=new Date().toDateString();
+  const today=_episodes.filter(x=>new Date(x.t).toDateString()===day);
+  if(!today.length) return 'No connection interruptions today';
+  const last=new Date(today[today.length-1].t);
+  const hh=String(last.getHours()).padStart(2,'0')+':'+String(last.getMinutes()).padStart(2,'0');
+  return `Today: ${today.length} interruption${today.length>1?'s':''} (${today.filter(x=>x.s).length} visible), last ${hh}`;
+}
+function _recordEpisode(ms,shown){
+  const day=new Date().toDateString();
+  _episodes=_episodes.filter(x=>new Date(x.t).toDateString()===day);
+  _episodes.push({t:Date.now(),ms,s:shown?1:0});
+  try{ localStorage.setItem('mep',JSON.stringify(_episodes.slice(-50))); }catch{}
+  _updateKaIndicator();
+}
+
+function _updateKaIndicator(){
+  const d=document.getElementById('ftr-ka');if(!d) return;
+  const st=_kaState();
+  d.className=st==='active'?'ok':(st==='pending'?'warn':'');
+  const kaTxt={
+    active:'active (an inaudible tone keeps this tab from being frozen in the background)',
+    pending:'NOT active yet — click once anywhere in this tab',
+    off:'off (Settings)',unsupported:'not supported by this browser'}[st];
+  const wlTxt=!_wlWanted?'off (Settings)':!('wakeLock' in navigator)?'unavailable (needs http://127.0.0.1 or https)':(_wlSentinel?'held':'not held');
+  d.dataset.tip=`Tab keepalive: ${kaTxt} · Screen wake lock: ${wlTxt} · ${_episodeSummary()}`;
+  if(st==='pending'&&!_kaHinted){ _kaHinted=true; setStatus('Click once in this tab to enable the background keepalive'); }
+}
+
+// Applied every time settings are (re)fetched, so toggles take effect immediately.
+function _applyTabAliveSettings(){
+  _kaWanted=_settings.tabKeepalive!==false;
+  _wlWanted=_settings.screenWakeLock!==false;
+  if(_kaWanted) _kaStart(); else _kaStop();
+  if(_wlWanted) _wlAcquire(); else _wlRelease();
+  _updateKaIndicator();
+}
+['click','keydown','touchstart','pointerdown'].forEach(ev=>document.addEventListener(ev,_kaStart,{passive:true}));
+window.addEventListener('pageshow',()=>{ _kaStart(); _wlAcquire(); });
+window.addEventListener('focus',()=>{ _kaStart(); _wlAcquire(); });
+document.addEventListener('visibilitychange',()=>{ _kaStart(); if(!document.hidden) _wlAcquire(); });
 
 // DOM refs needed by poll callbacks — must be initialized before any async poll result
 const fQ=document.getElementById('ftr-quote');
@@ -124,7 +198,7 @@ function g(fn){ let t=0; return function(...a){const n=Date.now();if(n-t<500)ret
 function el(tag,cls){ const e=document.createElement(tag); if(cls)e.className=cls; return e; }
 function dotCls(e){ return e.crash?'crash':e.pid?'run':'stop'; }
 function uidIdx(uid){ return entries.findIndex(e=>e.uid===uid); }
-function isAlwaysValid(uid){ return uid===MAESTRO_UID||uid===EXPLORER_UID; }
+function isAlwaysValid(uid){ return uid===MAESTRO_UID; }
 const isWebapp   =uid=>/_w\d+$/.test(uid);
 const isFvPanel  =uid=>uid.startsWith('fv_');
 const isInfoPanel=uid=>uid.startsWith('info_');
@@ -191,7 +265,8 @@ function _mkHash(es){
 
 async function poll(){
   const d=await api('GET','/api/state');
-  if(d&&d.entries){ _lastPollOk=Date.now(); _lastPollNetErr=false; _setConnText('— CONNECTED —'); } else { _lastPollNetErr=true; }
+  if(d&&d.entries){ _lastPollOk=Date.now(); _lastPollNetErr=false; _setConnText('— CONNECTED —'); }
+  else { _lastPollNetErr=true; _checkStale(); }   // no-op until STALE_MS of silence; also covers a visible tab
   if(!d||!d.entries) return;
   entries=d.entries;
   if(d.loggingEnabled!==undefined) _loggingEnabled=d.loggingEnabled;
@@ -200,6 +275,7 @@ async function poll(){
   if(h!==_prevHash){ _prevHash=h; renderSidebar(); }
   else { patchMeta(); }
 
+  _autoSuspendIdleTabs();
   renderPills();
   updatePanelMeta();
   patchPanelTitles();
@@ -207,25 +283,11 @@ async function poll(){
   updateFooterForActiveTab();
   _updateMaestroEye();
 
-  // Blank iframes whose process stopped
-  entries.forEach(e=>{
-    (e.webapps||[]).forEach((_,wi)=>{
-      const uid=`${e.uid}_w${wi}`;
-      if(!e.pid&&_tabReady.has(uid)){
-        _tabReady.delete(uid);
-        const ifr=tabIframes[uid];
-        if(ifr){ifr.style.opacity='0';ifr.src='about:blank';}
-        const ph=document.getElementById('ph-'+uid);
-        if(ph) ph.style.display='flex';
-      }
-    });
-  });
-
   // Remove panels whose entry no longer exists in config at all
   const validUIDs=new Set([
     ...entries.map(e=>e.uid),
     ...entries.flatMap(e=>(e.webapps||[]).map((_,wi)=>`${e.uid}_w${wi}`)),
-    MAESTRO_UID,EXPLORER_UID,
+    MAESTRO_UID,
     ...entries.filter(e=>e.sepFile).map(e=>'fv_'+e.uid),
     ...entries.filter(e=>e.infoFile).map(e=>'info_'+e.uid),
   ]);
@@ -235,7 +297,6 @@ async function poll(){
   if(stalePanels.length){
     stalePanels.forEach(uid=>{
       panels=panels.filter(u=>u!==uid);
-      if(sseConns[uid]){sseConns[uid].close();delete sseConns[uid];}
       document.querySelector(`.tp[data-uid="${CSS.escape(uid)}"]`)?.remove();
     });
     _savePanels();
@@ -243,12 +304,8 @@ async function poll(){
     renderSidebar();
   }
 
-  // Connect SSE for open panels that lost connection.
-  // renderGrid first so panel DOM nodes exist before log events arrive.
-  const needSSE=panels.filter(uid=>!isWebapp(uid)&&!isFvPanel(uid)&&!isInfoPanel(uid)&&!sseConns[uid]);
-  if(needSSE.length) renderGrid();
-  needSSE.forEach(uid=>connectSSE(uid));
-  if(activeTab&&!sseConns[activeTab]&&!isWebapp(activeTab)) connectSSE(activeTab);
+  // Self-heal the single log stream (no-op while it is healthy).
+  _ensureLogStream(false);
 }
 
 function _pollSoon(){
@@ -327,33 +384,6 @@ function _hideConnOverlay(){
 // remains only for short one-off action feedback via setStatus(), e.g.
 // "Saved.", "Launch failed: ...".)
 
-// ── Force-reconnect all SSE connections ───────────────────────────────────────
-// EventSource.readyState is NOT trustworthy after a browser tab suspend/resume:
-// Chrome can keep reporting OPEN for a socket that is actually dead, especially
-// on loopback connections where there's no network-level signal (no RST, no
-// link-down event) to make the browser realize the connection is gone. A
-// "zombie" open EventSource still counts against Chrome's per-origin HTTP/1.1
-// connection limit (6 concurrent). With a few panels open, dead zombie sockets
-// can permanently saturate that pool — every other request (a fresh fetch, or
-// a new EventSource) then queues forever waiting for a free slot, visible in
-// DevTools as "Provisional headers are shown" on a request that never even
-// gets dispatched to the network. THIS was the actual root cause of the
-// watchdog looking permanently stuck: its own reconnect attempts were queuing
-// behind dead SSE sockets that never got closed, no matter how many times it
-// retried. The only reliable fix is to stop trusting readyState and
-// unconditionally close + reopen every SSE connection on wake, which forces
-// Chrome to release those slots immediately.
-function _forceReconnectAllSSE(){
-  Object.keys(sseConns).forEach(uid=>{
-    try{ sseConns[uid].close(); }catch{}
-  });
-  sseConns={};
-  panels.forEach(uid=>{
-    if(!isWebapp(uid)&&!isFvPanel(uid)&&!isInfoPanel(uid)) connectSSE(uid);
-  });
-  if(activeTab&&!isWebapp(activeTab)) connectSSE(activeTab);
-}
-
 // ── Stale connection watchdog ─────────────────────────────────────────────────
 // Called on tab visibility return and before Launch/Kill actions. Checks the
 // age of the last successful poll; if too old, alerts the user in the footer
@@ -362,7 +392,16 @@ async function _checkStale(){
   if(_staleActive) return;
   if(Date.now()-_lastPollOk<STALE_MS) return;
   _staleActive=true;
-  _forceReconnectAllSSE();
+  _staleStartedAt=Date.now();
+  _ensureLogStream(false);
+  // Silent first attempt (S5): right after a wake/resume a single fresh snapshot
+  // usually clears the problem, and then no red/yellow flash is ever shown.
+  await Promise.race([forcePoll(),new Promise(r=>setTimeout(r,QUICK_PROBE_MS))]);
+  if(Date.now()-_lastPollOk<STALE_MS){
+    _staleActive=false;
+    _recordEpisode(Date.now()-_staleStartedAt,false);
+    return;
+  }
   const msg=_lastPollNetErr
     ?'SERVER NON RAGGIUNGIBILE — RICONNESSIONE…'
     :'TAB SOSPESA DAL BROWSER — RICONNESSIONE…';
@@ -377,16 +416,13 @@ async function _checkStale(){
 // first fetch right after a browser un-suspends a tab often still rides a
 // half-dead connection, a couple of quick retries usually clears that.
 //
-// Slow phase (attempt >= FAST_TRIES): retries every SLOW_RETRY_MS indefinitely.
-// This is deliberately NOT capped — real-world testing showed the manual
-// "refresh / stop / refresh a few times" workaround needed more than 3 tries
-// over 20s to succeed, so the watchdog now keeps trying for as long as it
-// takes, with a clickable footer message for an immediate manual retry.
+// Slow phase (attempt >= FAST_TRIES): retries every SLOW_RETRY_MS indefinitely,
+// with a clickable footer message for an immediate manual retry. The OS
+// notification fires only once the episode has lasted NOTIFY_AFTER_MS (S5):
+// shorter interruptions just update the footer.
 //
 // The loop pauses (does not give up) if the tab goes back to background —
-// _staleActive is released so a fresh _checkStale() naturally restarts it
-// when the tab becomes visible again, rather than silently spinning forever
-// on a tab nobody is looking at.
+// _staleActive is released so a fresh _checkStale() restarts it on return.
 async function _reconnectCycle(attempt){
   if(!_pageVisible){ _staleActive=false; return; }
   await forcePoll();
@@ -397,11 +433,7 @@ async function _reconnectCycle(attempt){
     _reconnectTimer=setTimeout(()=>_reconnectCycle(attempt+1),FAST_GAP_MS);
     return;
   }
-  // Fast retries exhausted without recovering — this is no longer a quick
-  // blip, it's worth surfacing via an OS-level notification too, since the
-  // user may not be looking at this tab (or any tab) right now. Fired once
-  // per stale episode, not on every subsequent slow-phase retry.
-  if(!_staleNotified){
+  if(!_staleNotified&&Date.now()-_staleStartedAt>=NOTIFY_AFTER_MS){
     _staleNotified=true;
     notify('Maestro — connessione persa',
       'La tab non risponde da un po\u2019. Riconnessione automatica in corso in background.');
@@ -415,29 +447,28 @@ async function _reconnectCycle(attempt){
 
 function _onReconnected(){
   clearTimeout(_reconnectTimer);_reconnectTimer=null;
-  // Only notify "reconnected" if we actually notified "connection lost"
-  // earlier in this episode — otherwise a routine fast-phase recovery
-  // (which never reached the slow phase) would fire a notification the
-  // user never asked for, for a blip they likely never even noticed.
+  // Only notify "reconnected" if "connection lost" was notified in this episode.
   if(_staleNotified) notify('Maestro — riconnesso', 'La connessione è stata ripristinata.');
   _staleNotified=false;
-  // SSE connections were already unconditionally force-closed and reopened by
-  // _forceReconnectAllSSE() when this stale episode started (see _checkStale)
-  // — nothing more to do for them here, and readyState isn't trustworthy
-  // enough to base any further decision on.
+  // The log stream is a single connection that heals itself (see
+  // _ensureLogStream): nothing more to do for it here.
   // Webapp iframes (Jellyfin, Tunarr, ComfyUI, ...) don't use SSE and can't
-  // self-heal from Maestro's side — they're a different origin running their
-  // own JS. A stale/dead connection inside one of them just sits there broken
-  // until something forces a fresh load. Force-reload every webapp tab whose
-  // process is still running, exactly what manually hitting reload on each of
-  // them accomplishes, just automatic.
-  _tabReady.forEach(uid=>{
+  // self-heal from Maestro's side: a dead connection inside one of them just sits
+  // there broken. Reload only the tab the user is looking at; every other loaded
+  // tab goes back to the paused state and reloads when clicked, so a reconnection
+  // never triggers several heavy page loads at once.
+  Object.keys(tabIframes).forEach(uid=>{
+    if(!isWebTabLoaded(uid)) return;
     const m=uid.match(/^(.+)_w(\d+)$/);if(!m)return;
     const e=entries.find(x=>x.uid===m[1]);
-    if(e&&e.pid) reloadWebTab(uid);
+    if(!e||!e.pid) return;
+    if(uid===activeTab) reloadWebTab(uid);
+    else pauseWebTab(uid,tabIframes[uid].dataset.origUrl||'');
   });
+  // Green only now: forcePoll() has just returned fresh data.
   _connOverlay('RICONNESSO!',{color:'green',duration:2500});
   _staleActive=false;
+  _recordEpisode(Date.now()-_staleStartedAt,true);
 }
 
 function updateFooterForActiveTab(){
@@ -509,6 +540,16 @@ function renderPills(){
   const cur=new Set(pills.map(p=>p.uid));
   _tabOrder=_tabOrder.filter(u=>cur.has(u));
   pills.forEach(p=>{if(!_tabOrder.includes(p.uid))_tabOrder.push(p.uid);});
+  // Lazy webapp tabs: a tab whose process just started is PAUSED — nothing is loaded
+  // (and no request reaches the webapp) until the user clicks it or its ▶. A tab whose
+  // process stopped is blanked and forgotten, so its next launch starts paused again.
+  [..._seenTabs].filter(u=>!cur.has(u)).forEach(u=>{ _seenTabs.delete(u); forgetWebTab(u); });
+  pills.forEach(p=>{
+    if(_seenTabs.has(p.uid)) return;
+    _seenTabs.add(p.uid);
+    if(p.uid===activeTab) _wakeTab(p.uid,p.wb.url||'');   // active tab restored after a page refresh: load it
+    else{ _suspendedTabs.add(p.uid); _autoPaused.add(p.uid); }
+  });
   pills.forEach(({uid,e,wi,wb})=>bar.appendChild(makePill(e,wi,wb)));
 
   if(activeTab&&!cur.has(activeTab)){
@@ -524,7 +565,7 @@ function makePill(e,wi=0,wb={}){
   const dcls=e.crash?'crash':e.pid?'run':'stop';
   const label=e.displayName||(e.path||'').split('/').pop();
   const url=wb.url||'';
-  const pill=el('div','tab tab-web'+(isActive?' active':''));
+  const pill=el('div','tab tab-web'+(isActive?' active':'')+(_suspendedTabs.has(uid)?' tab-paused':''));
   pill.draggable=true;pill.dataset.tabUid=uid;pill.dataset.tip=`🌐 ${label} — ${url}`;
   const dot=el('div','tab-dot '+dcls);dot.dataset.pdot=e.uid;
   const nm=el('span','tab-name');nm.textContent=`🌐 ${label}`;nm.style.pointerEvents='none';
@@ -532,7 +573,7 @@ function makePill(e,wi=0,wb={}){
   btnRef.onclick=ev=>{ev.stopPropagation();reloadWebTab(uid);};
   const susp=_suspendedTabs.has(uid);
   const btnSusp=el('button','tab-ibtn');
-  btnSusp.textContent=susp?'▶':'⏸';btnSusp.title=susp?'Resume':'Suspend';
+  btnSusp.textContent=susp?'▶':'⏸';btnSusp.title=susp?(_autoPaused.has(uid)?'Load (paused)':'Resume'):'Suspend';
   btnSusp.onclick=ev=>{ev.stopPropagation();toggleSuspend(uid,url);};
   pill.append(dot,nm,btnRef,btnSusp);
   pill.onclick=g(()=>clickPill(uid,e,wb));
@@ -561,8 +602,34 @@ async function _onTabDrop(srcUid,dstUid){
   await poll();
 }
 
+// Load a paused / not-yet-loaded webapp tab (ping until the app answers, then set the iframe src).
+function _wakeTab(uid,url){ _autoPaused.delete(uid); _resumeTab(uid,url); }
+
+// Auto-pause: a loaded webapp tab that has not been the visible tab for
+// webAppAutoSuspendMin minutes goes back to the paused state (its page is blanked,
+// freeing the memory the page held); clicking the tab loads it again. 0 = never.
+// Runs from poll(), i.e. only while the Maestro tab itself is visible.
+const _tabLastSeen={};   // webuid -> timestamp it was last the visible tab
+function _autoSuspendIdleTabs(){
+  const now=Date.now();
+  if(activeTab) _tabLastSeen[activeTab]=now;
+  const mins=Number(_settings.webAppAutoSuspendMin??10);
+  if(!(mins>0)) return;
+  Object.keys(tabIframes).forEach(uid=>{
+    if(uid===activeTab||!isWebTabLoaded(uid)||_suspendedTabs.has(uid)) return;
+    if(!_tabLastSeen[uid]){ _tabLastSeen[uid]=now; return; }
+    if(now-_tabLastSeen[uid]>=mins*60000){
+      pauseWebTab(uid,tabIframes[uid].dataset.origUrl||'');
+      setStatus(`⏸ A webapp tab was paused after ${mins} min unused — click it to load it again`);
+    }
+  });
+}
+
 function clickPill(uid,e,wb){
-  if(activeTab===uid){reloadWebTab(uid);return;}
+  if(activeTab===uid){
+    if(_suspendedTabs.has(uid)){ if(_autoPaused.has(uid)) _wakeTab(uid,wb.url||''); return; }  // manual suspend: use its Resume button
+    reloadWebTab(uid);return;
+  }
   activeTab=uid;activateTabContainer(uid,e,wb);renderPills();updateFooterForActiveTab();
   try{sessionStorage.setItem('mat',uid);}catch{}
 }
@@ -580,7 +647,8 @@ function activateTabContainer(uid,e,wb){
   let cont=document.getElementById('tc-'+uid);
   if(!cont) cont=createWebContainer(uid,url,tv);
   cont.classList.add('tv-active');
-  if(_tabReady.has(uid)){const ifr=tabIframes[uid];if(ifr&&(ifr.src==='about:blank'||!ifr.src))loadWebTab(uid,url);}
+  // First click on a paused tab loads it (never loaded before the click)
+  if(_autoPaused.has(uid)||(!_suspendedTabs.has(uid)&&!isWebTabLoaded(uid))) _wakeTab(uid,url);
 }
 function renderTabView(){
   if(!activeTab){document.getElementById('tab-view').classList.remove('active');return;}
@@ -702,12 +770,11 @@ function toggleInfoPanel(uid,fp){ panels.includes(uid)?hidePanel(uid):openInfoPa
 
 function openPanel(uid){
   if(!panels.includes(uid)){
-    if(panels.filter(u=>u!==EXPLORER_UID).length>=MAX_PANELS){setStatus(`Max ${MAX_PANELS} panels`);return;}
+    if(panels.length>=MAX_PANELS){setStatus(`Max ${MAX_PANELS} panels`);return;}
     panels.push(uid);
   }
-  // renderGrid first so panel DOM exists before SSE log events arrive
+  // The panel is filled from the client-side log buffer on creation (makeTermPanel)
   renderGrid();_savePanels();renderSidebar();
-  if(!isFvPanel(uid)&&!isInfoPanel(uid)&&!sseConns[uid]) connectSSE(uid);
 }
 async function openFvPanel(uid,fp){
   if(!panels.includes(uid)) panels.push(uid);
@@ -727,7 +794,6 @@ async function openInfoPanel(uid,fp){
 }
 function hidePanel(uid){
   panels=panels.filter(u=>u!==uid);
-  if(sseConns[uid]){sseConns[uid].close();delete sseConns[uid];}
   document.querySelector(`.tp[data-uid="${CSS.escape(uid)}"]`)?.remove();
   _savePanels();renderGrid();renderSidebar();
 }
@@ -752,14 +818,7 @@ function renderGrid(){
   const tv=document.getElementById('tab-view');
   if(activeTab) tv.classList.add('active'); else tv.classList.remove('active');
 
-  // Explorer panel
-  const hasExp=panels.includes(EXPLORER_UID);
-  if(hasExp){
-    if(!main.querySelector('.tp-exp')) main.appendChild(makeExplorerPanel());
-    main.querySelector('.tp-exp').style.display='flex';
-  } else { main.querySelector('.tp-exp')?.remove(); }
-
-  const gp=panels.filter(u=>u!==EXPLORER_UID); // grid panels
+  const gp=panels.slice(); // grid panels
 
   if(gp.length===0){
     main.style.gridTemplateColumns='1fr';
@@ -771,7 +830,7 @@ function renderGrid(){
         '<div>No terminals open.<br><small style="font-size:11px">Launch a script to open its panel.</small></div>';
       main.appendChild(es);
     }
-    main.querySelectorAll('.tp:not(.tp-exp)').forEach(p=>p.remove());
+    main.querySelectorAll('.tp').forEach(p=>p.remove());
     return;
   }
   main.querySelector('.empty-state')?.remove();
@@ -787,7 +846,7 @@ function renderGrid(){
   main.style.gridAutoRows='1fr'; // safety net for overflow rows (wide panels)
 
   // Remove DOM panels no longer in list
-  main.querySelectorAll('.tp:not(.tp-exp)').forEach(p=>{
+  main.querySelectorAll('.tp').forEach(p=>{
     if(!gp.includes(p.dataset.uid)) p.remove();
   });
 
@@ -882,6 +941,13 @@ function makeTermPanel(uid){
   body.addEventListener('scroll',()=>{ms=(body.scrollHeight-body.scrollTop-body.clientHeight)>60;});
   body._ms=()=>ms;
   const pre=el('pre','tp-pre');pre.dataset.ppre=uid;
+  const hb=_logBuf[uid];
+  if(hb&&hb.length){
+    const frag=document.createDocumentFragment();
+    hb.forEach(x=>frag.appendChild(_mkLogSpan(x.t,x.c)));
+    pre.appendChild(frag);
+  }
+  if(_logPartial[uid]){ const sp=el('span','ll lp');sp.textContent=_logPartial[uid];pre.appendChild(sp); }
   body.appendChild(pre);panel.append(hdr,body);
   return panel;
 }
@@ -922,32 +988,6 @@ function makeInfoPanel(uid){
   return panel;
 }
 
-function makeExplorerPanel(){
-  const panel=el('div','tp tp-exp');panel.dataset.uid=EXPLORER_UID;
-  const hdr=el('div','tp-hdr nodrag');hdr.draggable=false;
-  const title=el('div','tp-title');title.textContent='📁 File Explorer';
-  hdr.append(title,
-    tpbtn('📂','Open Thunar',()=>api('POST','/api/open-app',{app:'thunar',path:_explorerPath||'/home'})),
-    tpbtn('✕','Close',()=>hidePanel(EXPLORER_UID)));
-  const exp=el('div','tp-explorer');
-  const lp=el('div','exp-pane');
-  const lh=el('div','exp-header');lh.id='exp-lh';lh.textContent='Select a folder';
-  const ll=el('div','exp-list');ll.id='exp-ll';lp.append(lh,ll);
-  const rp=el('div','exp-pane');
-  const rh=el('div','exp-header');rh.id='exp-rh';rh.textContent='Select a file';
-  const rw=el('div','exp-file-wrap');
-  const rta=document.createElement('textarea');rta.className='exp-file-ta';rta.id='exp-ta';rta.spellcheck=false;
-  const rtbar=el('div','exp-toolbar');
-  const bSave=el('button','exp-btn');bSave.textContent='💾 Save';bSave.dataset.tip='Save file';
-  bSave.onclick=async()=>{const p=rta.dataset.path;if(!p)return;const r=await api('POST','/api/write-file',{path:p,content:rta.value});setStatus(r.ok?'Saved.':'Failed: '+(r.error||'?'));};
-  const bExt=el('button','exp-btn');bExt.textContent='↗ Open External';bExt.dataset.tip='Open in text editor';
-  bExt.onclick=()=>{const p=rta.dataset.path;if(p)api('POST','/api/open-editor',{path:p});};
-  rtbar.append(bSave,bExt);rw.append(rta,rtbar);rp.append(rh,rw);exp.append(lp,rp);
-  panel.append(hdr,exp);
-  if(_treeCurrentPath) loadExplorerDir(_treeCurrentPath);
-  return panel;
-}
-
 function tpbtn(lbl,tip,fn){
   const b=el('button','tp-btn');b.textContent=lbl;b.title=tip;b.dataset.tip=tip;b.onclick=fn;b.draggable=false;return b;
 }
@@ -964,40 +1004,106 @@ function attachDrag(panel,hdr,uid){
   });
 }
 
-// ── SSE ───────────────────────────────────────────────────────────────────────
-function connectSSE(uid){
-  if(sseConns[uid]) sseConns[uid].close();
-  const es=new EventSource(`/api/logs/${uid}`);sseConns[uid]=es;
+// ── SSE (single multiplexed log stream) ───────────────────────────────────────
+// ONE EventSource (/api/logs-all) for every entry, instead of one per open panel:
+// browsers allow only 6 concurrent HTTP/1.1 connections per origin, and with 6+
+// open panels the SSE connections used to starve /api/state (the "constant
+// disconnect/reconnect" symptom — see README "Connection resilience").
+// Event data is JSON {u: uid, d: payload}. The server sends `reset` before every
+// (re)subscription replay of a uid, so a reconnect can never duplicate lines.
+function _mkLogSpan(line,cls){
+  const s=el('span','ll'+(cls?' '+cls:'')+(line.startsWith('[MAESTRO]')?' lm':'')+(line.startsWith('[UPDATE]')?' lu':''));
+  s.textContent=line;return s;
+}
+function _bufPush(uid,line,cls){
+  const b=_logBuf[uid]||(_logBuf[uid]=[]);
+  b.push({t:line,c:cls||''});
+  if(b.length>LOG_BUF_MAX+200) b.splice(0,b.length-LOG_BUF_MAX); // trim in batches, not on every line
+}
+
+// The line a program is rewriting with '\r' (x1 → x2 → x3 …) is ONE span, always the last
+// child of the panel's <pre>, whose text is replaced on every update — exactly what a
+// terminal shows. Finished lines are inserted before it; when the program ends the line
+// the server drops the partial and sends it as a normal `log` line.
+function _partialSpan(pre){
+  const l=pre.lastElementChild;
+  return (l&&l.classList.contains('lp'))?l:null;
+}
+function setPartial(uid,txt){
+  if(txt) _logPartial[uid]=txt; else delete _logPartial[uid];
+  const pre=document.querySelector(`[data-ppre="${uid}"]`);if(!pre) return;
+  let sp=_partialSpan(pre);
+  if(!txt){ sp?.remove(); return; }
+  if(!sp){ sp=el('span','ll lp'); pre.appendChild(sp); }
+  sp.textContent=txt;
+  const body=pre.parentElement;
+  if(body&&!body._ms?.()) requestAnimationFrame(()=>{ if(body) body.scrollTop=body.scrollHeight; });
+}
+
+function connectLogStream(){
+  if(_logMux){ try{_logMux.close();}catch{} }
+  _logConnAt=Date.now();_lastLogMsg=Date.now();
+  const es=new EventSource('/api/logs-all');_logMux=es;
   let replay=true;
   setTimeout(()=>{
+    if(_logMux!==es) return;
     replay=false;
-    // After replay window closes, scroll panel to bottom via rAF to ensure DOM is painted
+    // After the replay window closes, scroll panels to the bottom once painted
     requestAnimationFrame(()=>{
-      const body=document.querySelector(`.tp[data-uid="${CSS.escape(uid)}"] .tp-body`);
-      if(body) body.scrollTop=body.scrollHeight;
+      document.querySelectorAll('.tp .tp-body').forEach(b=>{ if(!b._ms?.()) b.scrollTop=b.scrollHeight; });
     });
   },1500);
-  es.addEventListener('log',  ev=>appendLog(uid,ev.data,'',replay));
-  es.addEventListener('clear',()=>document.querySelector(`[data-ppre="${uid}"]`)?.replaceChildren());
-  es.addEventListener('crash',ev=>{
-    appendLog(uid,`[MAESTRO] ⚠ Crashed (exit ${ev.data})`,'lc');
+  const on=(name,fn)=>es.addEventListener(name,ev=>{
+    _lastLogMsg=Date.now();
+    if(name==='ping') return;
+    let m=null;try{m=JSON.parse(ev.data);}catch{}
+    if(m&&typeof m.u==='string') fn(m.u,m.d);
+  });
+  es.addEventListener('ping',()=>{_lastLogMsg=Date.now();});
+  on('reset',uid=>{ _logBuf[uid]=[];delete _logPartial[uid];document.querySelector(`[data-ppre="${uid}"]`)?.replaceChildren(); });
+  on('gone', uid=>{ delete _logBuf[uid];delete _logPartial[uid]; });
+  on('partial',(uid,txt)=>setPartial(uid,txt));
+  on('log',  (uid,line)=>appendLog(uid,line,'',replay));
+  on('crash',(uid,rc)=>{
+    appendLog(uid,`[MAESTRO] ⚠ Crashed (exit ${rc})`,'lc');
     document.querySelector(`.tp[data-uid="${CSS.escape(uid)}"]`)?.classList.add('pcrash');
-    notify('Maestro: Crashed',(entries.find(x=>x.uid===uid)?.displayName)||uid);
+    // Browser notification only for panels the user has open (the tray already
+    // notifies natively for every crash)
+    if(panels.includes(uid)) notify('Maestro: Crashed',(entries.find(x=>x.uid===uid)?.displayName)||uid);
     _pollSoon();
   });
-  es.addEventListener('close_panel',()=>{hidePanel(uid);_pollSoon();});
-  es.addEventListener('restart',()=>{
+  on('finished',()=>{ _pollSoon(); });   // clean exit (code 0): not a crash, the server already logged it
+  on('close_panel',uid=>{ if(panels.includes(uid)) hidePanel(uid); _pollSoon(); });
+  on('restart',uid=>{
     appendLog(uid,'[MAESTRO] ↺ Restarting…','lm');
     document.querySelector(`.tp[data-uid="${CSS.escape(uid)}"]`)?.classList.remove('pcrash');
     _pollSoon();
   });
-  es.onerror=()=>{};
+  es.onerror=()=>{};   // EventSource retries by itself; _ensureLogStream covers a stream that stays dead
+}
+
+function _closeLogStream(){
+  if(_logMux){ try{_logMux.close();}catch{} _logMux=null; }
+}
+
+// Reconnect the stream only when it is actually unhealthy (or `force`): closed,
+// or silent for LOG_STALE_MS (the server pings every ~5s when idle, so silence
+// means a dead socket, e.g. after a system sleep/resume). Reconnecting replays
+// every buffer, so it must not happen needlessly.
+function _ensureLogStream(force){
+  if(Date.now()-_logConnAt<LOG_MIN_RETRY) return;
+  const dead=!_logMux||_logMux.readyState===2||(Date.now()-_lastLogMsg)>LOG_STALE_MS;
+  if(force||dead) connectLogStream();
 }
 
 function appendLog(uid,line,cls,replay=false){
+  _bufPush(uid,line,cls);
   const pre=document.querySelector(`[data-ppre="${uid}"]`);if(!pre)return;
-  const s=el('span','ll'+(cls?' '+cls:'')+(line.startsWith('[MAESTRO]')?' lm':'')+(line.startsWith('[UPDATE]')?' lu':''));
-  s.textContent=line;pre.appendChild(s);
+  const sp=_partialSpan(pre),span=_mkLogSpan(line,cls);
+  if(sp) pre.insertBefore(span,sp); else pre.appendChild(span);
+  // Cap the panel DOM: one <span> per line is the main RAM cost of a chatty process
+  // left running for days. Trimmed in batches, same limit as the line buffers.
+  if(pre.childElementCount>LOG_BUF_MAX+200){ for(let i=0;i<200;i++) pre.removeChild(pre.firstChild); }
   const body=pre.parentElement;if(!body)return;
   if(!replay&&!body._ms?.()) requestAnimationFrame(()=>{if(body)body.scrollTop=body.scrollHeight;});
 }
@@ -1025,7 +1131,7 @@ async function doLaunch(uid){
   if(r&&r.error){setStatus('Launch failed: '+r.error);return;}
   // Optimistic UI update: right after a tab wakes from background sleep, the
   // browser's per-origin connection pool can still be draining/reopening SSE
-  // sockets (see _forceReconnectAllSSE), so the very next /api/state poll's
+  // sockets, so the very next /api/state poll's
   // fetch can queue behind them and resolve a beat late. Without this, the
   // sidebar/panel dot stayed grey until a SECOND click happened to land after
   // that delayed poll finally came back — even though the launch itself
@@ -1041,15 +1147,15 @@ async function doLaunch(uid){
     if(!e.launchHidden){
       renderGrid();_savePanels();renderSidebar();
     }
-    connectSSE(uid);
   }
-  (e.webapps||[]).forEach(async(wb,wi)=>{
-    const wurl=wb.url||'';if(!wurl)return;
+  // Webapp tabs always (re)start PAUSED: nothing is loaded, and no request is sent
+  // to the webapp, until the user clicks the tab. If the user is looking at one of
+  // them right now (relaunch), it reloads instead.
+  (e.webapps||[]).forEach((wb,wi)=>{
     const wuid=`${uid}_w${wi}`;
-    setStatus(`Waiting for ${wurl}…`);
-    const up=await pingUntilUp(wurl,30000);
-    setStatus(up?`${wurl} ready`:`${wurl} did not respond`);
-    if(up){_tabReady.add(wuid);if(activeTab===wuid)loadWebTab(wuid,wurl);}
+    _seenTabs.add(wuid);
+    if(activeTab===wuid){ _suspendedTabs.delete(wuid);_autoPaused.delete(wuid);reloadWebTab(wuid); }
+    else pauseWebTab(wuid,wb.url||'');
   });
   _pollSoon();
 }
@@ -1063,12 +1169,9 @@ async function doKill(uid){
   e.pid=null;e.crash=false;
   document.querySelectorAll(`[data-pdot="${uid}"]`).forEach(d=>d.className='dot stop');
   (e.webapps||[]).forEach((_,wi)=>{
-    const wuid=`${uid}_w${wi}`;_tabReady.delete(wuid);
-    const ifr=tabIframes[wuid];if(ifr){ifr.style.opacity='0';ifr.src='about:blank';}
-    const ph=document.getElementById('ph-'+wuid);if(ph)ph.style.display='flex';
+    const wuid=`${uid}_w${wi}`;_seenTabs.delete(wuid);forgetWebTab(wuid);
   });
   hidePanel(uid);
-  if(sseConns[uid]){sseConns[uid].close();delete sseConns[uid];}
   if(activeTab&&(activeTab===uid||(e.webapps||[]).some((_,wi)=>activeTab===`${uid}_w${wi}`))) closePill();
   _pollSoon();
 }
@@ -1077,7 +1180,7 @@ async function doRemove(uid){
   const e=entries.find(x=>x.uid===uid);if(!e)return;
   const idx=entries.indexOf(e);
   if(!confirm(`Remove "${e.displayName||e.path.split('/').pop()}"?`))return;
-  (e.webapps||[]).forEach((_,wi)=>_tabReady.delete(`${uid}_w${wi}`));
+  (e.webapps||[]).forEach((_,wi)=>{ const wuid=`${uid}_w${wi}`; _seenTabs.delete(wuid); forgetWebTab(wuid); });
   hidePanel(uid);hidePanel('fv_'+uid);hidePanel('info_'+uid);
   if(activeTab===uid||(e.webapps||[]).some((_,wi)=>activeTab===`${uid}_w${wi}`)) closePill();
   const r=await api('POST','/api/remove',{idx});
@@ -1088,6 +1191,7 @@ async function doRemove(uid){
 
 async function doClearLog(uid){
   document.querySelector(`[data-ppre="${uid}"]`)?.replaceChildren();
+  _logBuf[uid]=[];delete _logPartial[uid];
   await api('POST','/api/clear-log',{uid});
 }
 
@@ -1100,7 +1204,6 @@ async function doLaunchAllFav(){
     if(!e.openOutside&&!panels.includes(e.uid)){
       panels.push(e.uid);
       if(!e.launchHidden){ renderGrid();_savePanels(); }
-      connectSSE(e.uid);
     }
     await new Promise(r=>setTimeout(r,800));
   }
@@ -1121,7 +1224,7 @@ async function doKillAll(){
 
 async function doSwitchOff(){
   if(!confirm('Kill all processes and shut down Maestro?'))return;
-  Object.values(sseConns).forEach(es=>es.close());sseConns={};sessionStorage.clear();
+  _closeLogStream();sessionStorage.clear();
   await api('POST','/api/shutdown');
   document.body.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#6b5040;font-family:monospace">Maestro stopped.</div>';
 }
@@ -1180,7 +1283,7 @@ async function _runMaestroInstall(payload,label){
   }
 
   if(r&&r.ok){
-    Object.values(sseConns).forEach(es=>es.close());sseConns={};sessionStorage.clear();
+    _closeLogStream();sessionStorage.clear();
     document.body.innerHTML=
       '<div style="display:flex;align-items:center;justify-content:center;height:100vh;'+
       'color:#6b5040;font-family:monospace;text-align:center;line-height:2">'+
@@ -1321,8 +1424,7 @@ async function _fetchSettings(){
   const d=await api('GET','/api/settings');
   if(d&&!d.error){
     _settings=d;
-    // Apply explorer visibility immediately on every fetch
-    _applyExplorerSetting(!!_settings.fileExplorer);
+    _applyTabAliveSettings();
   }
   return _settings;
 }
@@ -1336,10 +1438,11 @@ function openSettings(){
     const secSupport=el('div','sm-section');
     const supportRow=el('div','sm-links-row');
     const btnSupport=el('a','sm-btn');
-    btnSupport.href='https://github.com/sponsors/apellaman/';btnSupport.target='_blank';
-    btnSupport.textContent='💛 Support me on Github';
+    // Opens in a new browser tab; rel=noopener keeps the external page from touching this one.
+    btnSupport.href='https://liberapay.com/pellaDev/donate';btnSupport.target='_blank';btnSupport.rel='noopener noreferrer';
+    btnSupport.textContent='💛 Donate on Liberapay';
     const btnStar=el('a','sm-btn');
-    btnStar.href='https://github.com/pellaDev/Maestro';btnStar.target='_blank';
+    btnStar.href='https://github.com/pellaDev/Maestro';btnStar.target='_blank';btnStar.rel='noopener noreferrer';
     btnStar.textContent='⭐ Star me on GitHub';
     // NOTE: GitHub does not offer any URL/deep-link that stars a repo on
     // click — starring is an authenticated POST action with no anonymous
@@ -1353,11 +1456,6 @@ function openSettings(){
 
     // ── General section ────────────────────────────────────────────────────────
     const secGen=_smSection('General');
-    secGen.appendChild(_smToggle('File Explorer','fileExplorer',!!s.fileExplorer,async v=>{
-      await api('POST','/api/settings',{fileExplorer:v});
-      _applyExplorerSetting(v);
-      await _fetchSettings();
-    }));
     secGen.appendChild(_smToggle('Logs Recorder','logsRecorder',!!s.logsRecorder,async v=>{
       await api('POST','/api/settings',{logsRecorder:v});
       _loggingEnabled=v;
@@ -1379,6 +1477,27 @@ function openSettings(){
       await api('POST','/api/settings',{systemNotifications:v});
       await _fetchSettings();
     }));
+    secGen.appendChild(_smToggle('Background tab keepalive','tabKeepalive',s.tabKeepalive!==false,async v=>{
+      await api('POST','/api/settings',{tabKeepalive:v});
+      await _fetchSettings();
+    }));
+    secGen.appendChild(_smToggle('Keep screen awake while visible','screenWakeLock',s.screenWakeLock!==false,async v=>{
+      await api('POST','/api/settings',{screenWakeLock:v});
+      await _fetchSettings();
+    }));
+    const autoSusp=_smInput('Auto-pause unused webapp tabs after (minutes, 0 = never)','number',String(s.webAppAutoSuspendMin??10));
+    autoSusp.min='0';autoSusp.max='1440';   // _smInput defaults to the port range
+    autoSusp.addEventListener('change',async()=>{
+      const v=Math.max(0,Math.min(1440,parseInt(autoSusp.value)||0));
+      autoSusp.value=String(v);
+      const r=await api('POST','/api/settings',{webAppAutoSuspendMin:v});
+      if(r&&r.error){setStatus('Save failed: '+r.error);return;}
+      await _fetchSettings();
+    });
+    secGen.appendChild(autoSusp._wrap);
+    const tabTip=el('div','finfo');
+    tabTip.textContent='Browser tip: pin this tab (right-click the tab → Pin tab) and add 127.0.0.1 to the browser\u2019s Memory Saver exclusions (Chrome/Brave: chrome://settings/performance) so it is never frozen or discarded in the background.';
+    secGen.appendChild(tabTip);
     body.appendChild(secGen);
 
     // ── Server section ─────────────────────────────────────────────────────────
@@ -1489,7 +1608,7 @@ function openSettings(){
       try{
         const r=await api('POST','/api/import',bundle);
         if(!r||!r.error){
-          Object.values(sseConns).forEach(es=>es.close());sseConns={};sessionStorage.clear();
+          _closeLogStream();sessionStorage.clear();
           _prevHash='';
           await _fetchSettings();
           closeSettings();
@@ -1554,79 +1673,7 @@ function _smInput(label,type,value){
   return i;
 }
 
-// ── Explorer ──────────────────────────────────────────────────────────────────
-async function loadExplorerDir(path){
-  _explorerPath=path;
-  const d=await api('GET',`/api/browse?path=${encodeURIComponent(path)}&all=1`);
-  if(d.error)return;
-  const lh=document.getElementById('exp-lh'),ll=document.getElementById('exp-ll');
-  if(!lh||!ll)return;
-  lh.textContent=d.path;ll.innerHTML='';
-  // Fix #5: filenames/dirnames come from the filesystem and could contain
-  // markup if an attacker had already dropped a maliciously-named file —
-  // build these rows with textContent, never innerHTML.
-  if(d.parent){
-    const r=el('div','exp-item tup');r.textContent='📁 ..';r.onclick=()=>loadExplorerDir(d.parent);ll.appendChild(r);
-  }
-  d.dirs.forEach(n=>{
-    const r=el('div','exp-item tdir');r.textContent=`📁 ${n}`;r.onclick=()=>loadExplorerDir(d.path+'/'+n);ll.appendChild(r);
-  });
-  d.files.forEach(n=>{
-    const r=el('div','exp-item tfile');r.textContent=`📄 ${n}`;
-    r.onclick=()=>{ll.querySelectorAll('.exp-item').forEach(x=>x.classList.remove('tsel'));r.classList.add('tsel');loadExpFile(d.path+'/'+n);};ll.appendChild(r);
-  });
-}
-async function loadExpFile(path){
-  const d=await api('GET',`/api/read-file?path=${encodeURIComponent(path)}`);
-  const rh=document.getElementById('exp-rh'),rta=document.getElementById('exp-ta');
-  if(!rh||!rta)return;
-  rh.textContent=d.name||path;rta.value=d.error?'Error: '+d.error:(d.content||'');rta.dataset.path=d.error?'':path;
-}
-async function loadTree(path){
-  _treeCurrentPath=path;
-  const d=await api('GET',`/api/browse?path=${encodeURIComponent(path)}`);
-  if(!d||d.error)return;
-  const tEl=document.getElementById('lsb-tree'),pEl=document.getElementById('lsb-tree-path');
-  if(!tEl)return;pEl.textContent=d.path;tEl.innerHTML='';
-  if(d.parent){const r=el('div','tree-item tup');r.textContent='📁 ..';r.onclick=()=>loadTree(d.parent);tEl.appendChild(r);}
-  (d.dirs||[]).forEach(name=>{
-    const r=el('div','tree-item tdir');r.textContent=`📁 ${name}`;
-    r.onclick=()=>{loadTree(d.path+'/'+name);if(!panels.includes(EXPLORER_UID))openPanel(EXPLORER_UID);else loadExplorerDir(d.path+'/'+name);};
-    tEl.appendChild(r);
-  });
-}
-loadTree('/home');
-
-// ── File Explorer toggle ───────────────────────────────────────────────────────
-// Controls visibility of:
-//   - #lsb-divider       (resize handle between script list and tree)
-//   - #lsb-tree-wrap     (sidebar file tree panel)
-//   - EXPLORER_UID panel (main area file explorer overlay)
-// When disabled: hides tree UI and closes the explorer panel if open.
-// When enabled:  shows tree UI and reloads the current tree path.
-function _applyExplorerSetting(enabled){
-  const divider  = document.getElementById('lsb-divider');
-  const treeWrap = document.getElementById('lsb-tree-wrap');
-  if(divider)  divider.style.display  = enabled ? '' : 'none';
-  if(treeWrap) treeWrap.style.display = enabled ? '' : 'none';
-  if(!enabled && panels.includes(EXPLORER_UID)){
-    hidePanel(EXPLORER_UID);
-  }
-  if(enabled && treeWrap && treeWrap.style.display !== 'none'){
-    // Reload tree at current path or default
-    loadTree(_treeCurrentPath || '/home');
-  }
-}
-
 // ── Resizers ──────────────────────────────────────────────────────────────────
-(function(){
-  const div=document.getElementById('lsb-divider'),wrap=document.getElementById('lsb-tree-wrap');
-  let drag=false,sy=0,sh=0;
-  div.addEventListener('mousedown',e=>{drag=true;sy=e.clientY;sh=wrap.offsetHeight;e.preventDefault();});
-  document.addEventListener('mousemove',e=>{if(!drag)return;wrap.style.height=Math.max(60,Math.min(500,sh+(sy-e.clientY)))+'px';});
-  document.addEventListener('mouseup',()=>drag=false);
-})();
-
 (function(){
   const res=document.getElementById('lsb-resizer');if(!res)return;
   let drag=false,startX=0,startW=0;
@@ -1653,26 +1700,58 @@ function _applyExplorerSetting(enabled){
   });
 })();
 
-// ── File browser ──────────────────────────────────────────────────────────────
-async function openFileBrowser(pathInput,insertAfter,filter='sh'){
-  document.getElementById('_fb')?.remove();
-  const wrap=el('div','');wrap.id='_fb';
-  const pathDiv=el('div','fb-path');pathDiv.textContent='Loading…';
-  const box=el('div','fb-box');wrap.append(pathDiv,box);
-  insertAfter.parentNode.insertBefore(wrap,insertAfter.nextSibling);
-  async function load(path){
-    let url=`/api/browse?path=${encodeURIComponent(path)}`;
-    if(filter==='all')url+='&all=1';else if(filter==='md')url+='&md=1';
-    const d=await api('GET',url);box.innerHTML='';
-    if(d.error){const m=el('div','fb-item fmsg');m.textContent=d.error;box.appendChild(m);return;}
-    _fbPath=d.path;pathDiv.textContent=d.path;
-    // Fix #5: filesystem-derived names via textContent, never innerHTML.
-    if(d.parent){const r=el('div','fb-item fup');r.textContent='📁 ..';r.onclick=()=>load(d.parent);box.appendChild(r);}
-    (d.dirs||[]).forEach(n=>{const r=el('div','fb-item fdir');r.textContent=`📁 ${n}`;r.onclick=()=>load(d.path+'/'+n);box.appendChild(r);});
-    (d.files||[]).forEach(n=>{const r=el('div','fb-item ffile');r.textContent=`📄 ${n}`;r.onclick=()=>{pathInput.value=d.path+'/'+n;wrap.remove();};box.appendChild(r);});
-    if(!d.dirs?.length&&!d.files?.length){const m=el('div','fb-item fmsg');m.textContent='Empty folder';box.appendChild(m);}
+// ── Native file / folder picker ───────────────────────────────────────────────
+// A web page cannot read the real path of a file chosen with <input type=file>, and
+// Maestro needs real paths. So main.py opens the operating system's own file dialog
+// (POST /api/pick-path) and returns the chosen path. Deliberately NOT via api(): the
+// dialog stays open as long as the user likes, so the 6s API timeout must not apply.
+let _lastPickDir='';
+try{ _lastPickDir=localStorage.getItem('lpd')||''; }catch{}
+
+async function pickPath(kind,{title='',filter='any',start=''}={}){
+  let r;
+  try{
+    const res=await fetch('/api/pick-path',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({kind,title,filter,start:start||_lastPickDir})});
+    r=await res.json();
+  }catch(ex){ _connOverlay('FILE DIALOG FAILED: '+String(ex),{color:'red',duration:6000}); return null; }
+  if(!r||!r.ok){ _connOverlay((r&&r.error)||'FILE DIALOG FAILED',{color:'red',duration:9000}); return null; }
+  if(r.cancelled||!r.path) return null;
+  try{
+    _lastPickDir=kind==='folder'?r.path:r.path.replace(/[\\/][^\\/]*$/,'');
+    localStorage.setItem('lpd',_lastPickDir);
+  }catch{}
+  return r.path;
+}
+
+// Replaces a "type the path" text field: a button that opens the OS dialog, the chosen
+// path shown below it, and a hidden <input id=...> that keeps the value so existing
+// code can keep reading document.getElementById(id).value. `filter` is one of
+// 'launchable' | 'sh' | 'md' | 'any' (see main.py _PICK_FILTERS).
+function makePathPicker(label,id,value,{kind='file',filter='any',optional=false}={}){
+  const w=el('div','field');
+  const l=el('label','');l.textContent=label;
+  const hid=el('input','');hid.type='hidden';hid.id=id;hid.value=value||'';
+  const row=el('div','');row.style.cssText='display:flex;gap:6px;align-items:stretch';
+  const btn=el('button','rbtn sec');btn.style.flex='1';
+  const clr=el('button','rbtn sec');clr.textContent='✕';clr.title='Clear';clr.style.cssText='width:auto;flex-shrink:0;padding:8px 12px';
+  const shown=el('div','finfo');
+  const noun=kind==='folder'?'folder':'file';
+  function refresh(){
+    btn.textContent=hid.value?`📂 Change ${noun}…`:`📂 Choose ${noun}…`;
+    shown.textContent=hid.value||'(none selected)';shown.title=hid.value;
+    clr.style.display=(optional&&hid.value)?'':'none';
   }
-  load(_fbPath||_treeCurrentPath||'/home');
+  btn.onclick=async()=>{
+    btn.disabled=true;btn.textContent='Waiting for the file dialog…';
+    const p=await pickPath(kind,{title:label,filter,start:hid.value||''});
+    btn.disabled=false;
+    if(p) hid.value=p;
+    refresh();
+  };
+  clr.onclick=()=>{ hid.value='';refresh(); };
+  row.append(btn,clr);w.append(l,row,shown,hid);
+  refresh();return w;
 }
 
 // ── Colour picker ─────────────────────────────────────────────────────────────
@@ -1695,18 +1774,15 @@ function makeColorPicker(current,onChange){
 function doAdd(){
   openRsb('Add Script');
   const body=document.getElementById('rsb-body');body.innerHTML='';
-  const pathF=rfield('Full path to .sh script','text','r-add-path','');
-  const pathInp=pathF.querySelector('input');
-  const btnBrowse=el('button','rbtn sec');btnBrowse.textContent='📂 Browse';
-  btnBrowse.onclick=()=>openFileBrowser(pathInp,btnBrowse,'sh');
+  const pathPk=makePathPicker('Script or executable','r-add-path','',{kind:'file',filter:'launchable'});
   const wbList=el('div','');wbList.id='r-wb-add';
   const btnWb=el('button','rbtn sec');btnWb.textContent='＋ Add WebApp URL';btnWb.onclick=()=>addWbEntry(wbList);
-  body.append(rfield('Display name','text','r-add-name',''),pathF,btnBrowse,
-    rinfo('Browse or type the full path.'),rtog('Launch hidden','r-add-lh',false),
+  body.append(rfield('Display name','text','r-add-name',''),pathPk,
+    rinfo('Supported: .sh, .AppImage, .run, .bin, .py, .jar, .exe, .bat, .cmd, .ps1 (what runs depends on the OS).'),rtog('Launch hidden','r-add-lh',false),
     rinfo('WebApp URLs:'),wbList,btnWb,hr());
   const btnAdd=el('button','rbtn');btnAdd.textContent='Add Script';
   btnAdd.onclick=g(async()=>{
-    const path=pathInp.value.trim(),name=document.getElementById('r-add-name').value.trim();
+    const path=document.getElementById('r-add-path').value.trim(),name=document.getElementById('r-add-name').value.trim();
     const lh=document.getElementById('r-add-lh').dataset.on==='true';
     const webapps=collectWbEntries(wbList);
     if(!path){setStatus('Enter a path');return;}
@@ -1733,10 +1809,8 @@ function openEdit(idx){
   openRsb(e.status==='SEP'?'Edit Separator':'Edit Entry');
   const body=document.getElementById('rsb-body');body.innerHTML='';
   if(e.status==='SEP'){
-    const sfF=rfield('Attached text file','text','r-sep-sf',e.sepFile||'');
-    const sfInp=sfF.querySelector('input');
-    const btnSfB=el('button','rbtn sec');btnSfB.textContent='📂 Browse text file';btnSfB.onclick=()=>openFileBrowser(sfInp,btnSfB,'all');
-    body.append(rfield('Label','text','r-sep-lbl',e.displayName||e.path),sfF,btnSfB,hr(),
+    const sfPk=makePathPicker('Attached text file','r-sep-sf',e.sepFile||'',{filter:'any',optional:true});
+    body.append(rfield('Label','text','r-sep-lbl',e.displayName||e.path),sfPk,hr(),
       rbtn('▲ Move Up',async()=>doMove(idx,-1),true),rbtn('▼ Move Down',async()=>doMove(idx,1),true),hr(),
       rbtn('Save',g(async()=>{
         const lbl=document.getElementById('r-sep-lbl').value.trim();
@@ -1755,10 +1829,8 @@ function openEdit(idx){
       }),false,'dng'));return;
   }
   let _pc=e.termColor||'default';
-  const updF=rfield('Update script path','text','r-upd',e.updateScript||'');updF.querySelector('input').placeholder='(default: update.sh)';
-  const btnUpdB=el('button','rbtn sec');btnUpdB.textContent='📂 Browse';btnUpdB.onclick=()=>openFileBrowser(updF.querySelector('input'),btnUpdB,'sh');
-  const infoF=rfield('Info file (.md)','text','r-info',e.infoFile||'');infoF.querySelector('input').placeholder='(optional)';
-  const btnInfoB=el('button','rbtn sec');btnInfoB.textContent='📂 Browse .md';btnInfoB.onclick=()=>openFileBrowser(infoF.querySelector('input'),btnInfoB,'md');
+  const updPk=makePathPicker('Update script (default: update.sh next to the script)','r-upd',e.updateScript||'',{filter:'sh',optional:true});
+  const infoPk=makePathPicker('Info file (.md)','r-info',e.infoFile||'',{filter:'md',optional:true});
   const wbList=el('div','');wbList.id='r-wb-edit';(e.webapps||[]).forEach(wb=>addWbEntry(wbList,wb.url||''));
   const btnWb=el('button','rbtn sec');btnWb.textContent='＋ Add WebApp URL';btnWb.onclick=()=>addWbEntry(wbList);
   const cp=makeColorPicker(_pc,id=>{ _pc=id; });
@@ -1769,7 +1841,7 @@ function openEdit(idx){
     rtog('Do not close panel on crash','r-ko',e.keepOpen!==false),
     rtog('Launch hidden','r-lh',!!e.launchHidden),
     rtog('Open outside Maestro','r-oo',!!e.openOutside),
-    cp,hr(),rinfo('Update script'),updF,btnUpdB,hr(),rinfo('Info file (.md)'),infoF,btnInfoB,hr(),
+    cp,hr(),updPk,hr(),infoPk,hr(),
     rinfo('WebApp URLs:'),wbList,btnWb,hr(),
     rbtn('Save',g(async()=>{
       const name=document.getElementById('r-name').value.trim();
@@ -1824,7 +1896,5 @@ document.getElementById('btn-terms').onclick     =g(()=>{if(activeTab!==null)clo
 _fetchSettings();
 try{const a=sessionStorage.getItem('mat');if(a)activeTab=a;}catch{}
 renderGrid();
-panels.forEach(uid=>{
-  if(!isWebapp(uid)&&!isFvPanel(uid)&&!isInfoPanel(uid)&&uid!==EXPLORER_UID) connectSSE(uid);
-});
+connectLogStream();
 if(activeTab) renderTabView();

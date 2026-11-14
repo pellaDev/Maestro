@@ -149,7 +149,7 @@ print(f"{DIM}  ████╗ ████║██╔══██╗██╔�
 print(f"{BOLD}  ██╔████╔██║███████║█████╗  ███████╗   ██║   ██████╔╝██║   ██║{RST}")
 print(f"{DIM}  ██║╚██╔╝██║██╔══██║██╔══╝  ╚════██║   ██║   ██╔══██╗██║   ██║{RST}")
 print(f"{BOLD}  ██║ ╚═╝ ██║██║  ██║███████╗███████║   ██║   ██║  ██║╚██████╔╝{RST}")
-print(f"{DIM}  ╚═╝     ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ {RST}v2.0")
+print(f"{DIM}  ╚═╝     ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ {RST}")
 print()
 print("  Privacy-first process orchestrator — Windows installer")
 print(f"  {DIM}https://github.com/pellaDev/Maestro{RST}")

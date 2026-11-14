@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Maestro — installer script (v2.0)
+# Maestro — installer script
 # Path: install.sh
 #
 # Usage:
@@ -134,7 +134,7 @@ echo -e "${DIM}  ████╗ ████║██╔══██╗██�
 echo -e "${BOLD}  ██╔████╔██║███████║█████╗  ███████╗   ██║   ██████╔╝██║   ██║${RST}"
 echo -e "${DIM}  ██║╚██╔╝██║██╔══██║██╔══╝  ╚════██║   ██║   ██╔══██╗██║   ██║${RST}"
 echo -e "${BOLD}  ██║ ╚═╝ ██║██║  ██║███████╗███████║   ██║   ██║  ██║╚██████╔╝${RST}"
-echo -e "${DIM}  ╚═╝     ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ${RST}v2.0"
+echo -e "${DIM}  ╚═╝     ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ${RST}"
 echo ""
 echo -e "  Privacy-first process orchestrator for Linux"
 echo -e "  ${DIM}https://github.com/pellaDev/Maestro${RST}"
