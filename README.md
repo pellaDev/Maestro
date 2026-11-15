@@ -99,7 +99,10 @@ yay -S libappindicator-gtk3      # optional, from AUR
 sudo zypper install python3-gobject typelib-1_0-AppIndicator3-0_1 libnotify-tools
 ```
 
-> **GNOME users** — if the tray icon is invisible, enable the AppIndicator Shell Extension:
+> **GNOME users** — stock GNOME Shell has no legacy tray, so **the tray icon is
+> usually invisible** without an AppIndicator shell extension. The installer says
+> so plainly when `AppIndicator3` is missing. Maestro keeps running without it
+> (web UI only) — that is normal, not a failed install. Enable it:
 > `gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com`
 > or install it from https://extensions.gnome.org/extension/615/appindicator-support/
 
@@ -148,6 +151,9 @@ also installable/switchable later from inside the app itself, via the Settings
 modal's **Update Maestro** section (CHECK LATEST / CHECK PRE-RELEASE buttons)
 — no need to re-clone or reinstall by hand once Maestro is already running.
 
+A plain `git clone` with no checkout lands on `main`, which is the Pre-release
+channel. Say which channel you actually installed before reporting a version.
+
 ### Linux — from GitHub
 
 **Pre-release (newest pre-release tag):**
@@ -187,6 +193,45 @@ Custom install path (optional — if you want bin/ and data/ somewhere else):
 bash install.sh --install-dir /custom/path
 bash install.sh --no-autostart   # skip autostart prompt
 ```
+
+### Non-interactive install (agents and scripts)
+
+Both installers ask for confirmation before creating anything. When nobody is
+there to answer, pass the flags that suppress every prompt:
+
+```bash
+bash install.sh --yes --no-menu-entry --no-autostart
+python install.py --yes --no-menu-entry --no-autostart
+```
+
+| Flag | Effect |
+|---|---|
+| `--yes` | Accept each prompt's default answer |
+| `--no-menu-entry` | Skip the application menu entry (Windows: Start Menu shortcut) |
+| `--no-autostart` | Skip the autostart prompt |
+
+Leave the flags out when a human installs interactively — the answers are the
+same, only asked instead of assumed.
+
+The rules for an agent running the install are in [AGENTS.md](AGENTS.md) and
+[docs/agent-install.md](docs/agent-install.md).
+
+### Verify the install
+
+An installer exiting `0` is not proof that Maestro is installed and running.
+"Installed" means every one of these is true:
+
+1. the installer exited `0`;
+2. `bin/` and `data/settings.json` exist inside the install directory;
+3. `data/settings.json` shows `host` `127.0.0.1` and `port` `8865` — the
+documented default, changed only when explicitly asked;
+4. after the first launch a listener is visible on that port:
+`ss -ltnp | grep 8865` (Windows: `netstat -ano | findstr 8865`);
+5. the UI loads at `http://127.0.0.1:8865`.
+
+If a check fails, stop there and report it. Do not change `host` or `port`, do
+not enable autostart or create a menu entry, and do not start anything that was
+not asked for.
 
 ### Linux — manual
 
@@ -273,6 +318,11 @@ python bin\start.py
 
 This launches `tray.py` (tray daemon + watchdog), which in turn launches `main.py` (HTTP server). The tray icon appears in your system notification area.
 
+`bash bin/start.sh` stays attached to the terminal that runs it: closing that
+terminal sends `SIGHUP` to `tray.py` and to its `main.py` child, so Maestro
+exits. For a detached start use the menu entry or autostart, or
+`setsid bash bin/start.sh &`.
+
 ### Open the UI
 
 - Click the tray icon → **Open in Browser**, or
@@ -292,6 +342,40 @@ This launches `tray.py` (tray daemon + watchdog), which in turn launches `main.p
 | ⚫ Grey | Intentionally shut down |
 
 Right-click the tray icon for: **Open in Browser**, **Restart Maestro**, **Autostart toggle**, **Shut Down**.
+
+Only one tray process runs — `tray.py` refuses a second instance through a
+guard file in the system temp directory. Two tray PIDs means it was launched
+twice, usually autostart plus a manual start. On stock GNOME the `GtkStatusIcon`
+fallback prints `Gtk-CRITICAL ... gtk_widget_get_scale_factor` warnings and shows
+no icon; that is the missing-extension case above, not a crash.
+
+### Terminal emulator (Open outside)
+
+`open_outside` scripts launch in an OS terminal emulator. Auto-detection order:
+`gnome-terminal`, `xfce4-terminal`, `xterm`, `konsole`, `lxterminal`,
+`mate-terminal`, `ptyxis`, `xdg-terminal-exec` — the first one found wins.
+
+**ptyxis** (default terminal on Fedora Workstation, GTK4/VTE) is supported, with
+two behaviours that need special handling:
+
+1. it does not propagate the command's exit code to its own process, so crash
+detection reads the real exit status from `data/terminal_state/<uid>.rc`, written
+by the wrapper the terminal actually runs;
+2. without `-s` it forwards the command to an already-running instance and the
+launcher exits immediately, so Maestro launches it with `-s` and trusts the state
+file instead of the launcher's return code.
+
+When a failure is detected the window stays open until a key is pressed, so the
+error is still readable.
+
+Override auto-detection with the `terminal` key in `settings.json`
+(⚙ Settings → Terminal emulator) or the `MAESTRO_TERMINAL` environment variable;
+`$TERMINAL` is honoured as a fallback. Any command line works — a name that is
+not one of the known emulators is used as-is (`<terminal> -- bash -c "<cmd>"`).
+If nothing is found, the error names the terminals actually tried and how to
+configure one.
+
+On Windows the internal panel is used; no external emulator is spawned.
 
 ### Updating Maestro
 
@@ -364,6 +448,7 @@ Located in `data/settings.json`. Edited via the ⚙ Settings modal in the UI.
 | `port` | `8865` | HTTP port |
 | `dataDir` | `""` | Custom data directory path (empty = default `../data/`) |
 | `githubToken` | `""` | GitHub Personal Access Token — only needed for **Update Maestro** while the repo is private. Server-side only, never sent to the browser. |
+| `terminal` | `""` | Preferred terminal emulator for `open_outside` launches (blank = auto-detect). Takes effect from the next launch. |
 
 ---
 
@@ -395,6 +480,32 @@ Data directory path resolution order:
 1. `MAESTRO_DATA` environment variable
 2. `dataDir` field in `settings.json`
 3. Default: `<install-dir>/data/`
+
+---
+
+## Uninstall
+
+Deleting the install folder alone is not a full removal — the installer may have
+created entries outside it.
+
+**Linux:**
+```bash
+rm -rf /path/to/Maestro
+rm -f ~/.local/share/applications/maestro.desktop   # application menu entry
+rm -f ~/.config/autostart/maestro.desktop           # autostart entry
+```
+
+**Windows:**
+
+- delete the install directory;
+- delete the Start Menu shortcut
+  `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Maestro.lnk`;
+- remove the autostart value `Maestro` under
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+  (`reg delete HKCU\Software\Microsoft\Windows\CurrentVersion\Run /f`).
+
+Quit the tray process first — one process only. `data/` holds the scripts list,
+settings and logs, so removing the folder removes your scripts too.
 
 ---
 

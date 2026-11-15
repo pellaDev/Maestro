@@ -1504,6 +1504,7 @@ function openSettings(){
     const secSrv=_smSection('Server (restart required)');
     const hostInp=_smInput('Host','text',s.host||'127.0.0.1');
     const portInp=_smInput('Port','number',String(s.port||8865));
+    const termInp=_smInput('Terminal emulator (blank = auto-detect, used from next launch)','text',s.terminal||'');
     const warnDiv=el('div','sm-warn');warnDiv.style.display='none';
     warnDiv.textContent='⚠ Exposing Maestro on the network — no authentication is active. Use on trusted networks only.';
     function _checkHostWarn(){warnDiv.style.display=(hostInp.value.trim()!=='127.0.0.1')?'block':'none';}
@@ -1511,12 +1512,12 @@ function openSettings(){
     const saveSrvBtn=el('button','rbtn sec');saveSrvBtn.textContent='Save Server Settings';
     saveSrvBtn.style.marginTop='4px';
     saveSrvBtn.onclick=async()=>{
-      const r=await api('POST','/api/settings',{host:hostInp.value.trim(),port:parseInt(portInp.value)||8865});
+      const r=await api('POST','/api/settings',{host:hostInp.value.trim(),port:parseInt(portInp.value)||8865,terminal:termInp.value.trim()});
       if(r&&r.error){setStatus('Save failed: '+r.error);return;}
       await _fetchSettings();
       setStatus('Server settings saved — restart to apply');
     };
-    secSrv.append(hostInp._wrap,portInp._wrap,warnDiv,saveSrvBtn);
+    secSrv.append(hostInp._wrap,portInp._wrap,termInp._wrap,warnDiv,saveSrvBtn);
     body.appendChild(secSrv);
 
     // ── Update Maestro section ─────────────────────────────────────────────────

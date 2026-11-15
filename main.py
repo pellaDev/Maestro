@@ -310,6 +310,7 @@ _DEFAULT_SETTINGS: dict = {
     "port":                8865,
     "dataDir":             "",
     "githubToken":         "",
+    "terminal":            "",
 }
 
 _settings:  dict = {}
@@ -1345,6 +1346,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if "host" in b and not isinstance(b["host"], str):
             self._err(400, "host must be a string")
             return
+        if "terminal" in b:
+            if not isinstance(b["terminal"], str):
+                self._err(400, 'terminal must be a string')
+                return
+            b["terminal"] = b["terminal"].strip()
         if "webAppAutoSuspendMin" in b:
             try:
                 m = int(b["webAppAutoSuspendMin"])

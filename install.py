@@ -135,6 +135,10 @@ parser.add_argument(
 )
 parser.add_argument('--no-autostart', action='store_true',
                     help='Skip the autostart prompt')
+parser.add_argument('--no-menu-entry', action='store_true',
+                    help='Skip the Start Menu shortcut prompt')
+parser.add_argument('--yes', action='store_true',
+                    help='Non-interactive: accept each prompt default answer')
 args = parser.parse_args()
 
 INSTALL_DIR = Path(args.install_dir).resolve()
@@ -221,7 +225,11 @@ info(f"  {INSTALL_DIR}")
 info(f"  ├── bin\\   (source files)")
 info(f"  └── data\\  (config, logs, settings)")
 print()
-confirm = input("  Proceed? [Y/n] ").strip() or 'Y'
+if args.yes:
+    confirm = 'Y'
+    info("Proceed (default answer, --yes)")
+else:
+    confirm = input("  Proceed? [Y/n] ").strip() or 'Y'
 if confirm.lower() != 'y':
     print("  Aborted.")
     sys.exit(0)
@@ -280,6 +288,7 @@ if not settings_file.exists():
         "host":                "127.0.0.1",
         "port":                8865,
         "dataDir":             "",
+        "terminal":            "",
     }
     settings_file.write_text(
         json.dumps(default_settings, indent=2) + '\n',
@@ -336,9 +345,14 @@ else:
 # flashes on launch — tray + background process only.
 hdr("Shortcut")
 print()
-create_shortcut = input(
-    "  Create a Start Menu shortcut (silent launch, no console window)? [Y/n] "
-).strip() or 'Y'
+if args.no_menu_entry:
+    create_shortcut = 'n'
+elif args.yes:
+    create_shortcut = 'Y'
+else:
+    create_shortcut = input(
+        "  Create a Start Menu shortcut (silent launch, no console window)? [Y/n] "
+    ).strip() or 'Y'
 if create_shortcut.lower() == 'y':
     pythonw = Path(sys.executable).with_name('pythonw.exe')
     start_py = BIN_DIR / 'start.py'
@@ -377,6 +391,7 @@ print(f"    Or from the Start Menu, if the shortcut was created")
 print()
 print(f"  {BOLD}UI:{RST}")
 print(f"    http://127.0.0.1:8865  (after launch)")
+print(f"    {DIM}Default port 8865 — change it only when explicitly asked.{RST}")
 print()
 print(f"  {BOLD}Data directory:{RST}")
 print(f"    {DATA_DIR}")
@@ -385,5 +400,16 @@ if not BASH_PATH:
     print()
     warn("Remember: install WSL or Git Bash to be able to run .sh scripts.")
 print()
-print(f"  {DIM}To uninstall: delete {INSTALL_DIR}{RST}")
+print(f"  {BOLD}Verify the install (after first launch):{RST}")
+print(f"    1. install.py exited 0; bin\\ and data\\settings.json exist")
+print(f"    2. settings.json shows host 127.0.0.1 and port 8865")
+print(f"    3. listener visible: netstat -ano | findstr 8865")
+print(f"    4. the UI loads at http://127.0.0.1:8865")
+print()
+print(f"  {BOLD}Uninstall (full removal):{RST}")
+print(f"    Delete {INSTALL_DIR}")
+print(f"    {DIM}# plus what this installer may have created:{RST}")
+print(f"    #   Start Menu shortcut: %APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Maestro.lnk")
+print(f"    #   Autostart: the HKCU Run key 'Maestro' (reg delete HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /f)")
+print(f"    {DIM}# one tray process only — quit it from the tray menu before deleting{RST}")
 print()

@@ -229,6 +229,8 @@ class ProcessEntry:
         self.pid             = pid
         self.proc            = None       # internal subprocess Popen
         self.ext_proc        = None       # external terminal Popen
+        self.ext_rc_file     = None       # file the wrapper writes the script's exit code to
+        self.ext_pid_file    = None       # file the wrapper writes the script's shell PID to
         self.crash           = False
         self.manually_killed = False
         self.generation      = 0          # incremented on each launch to invalidate old threads
@@ -605,15 +607,57 @@ def _get_bash_win():
 
 
 # ── External terminal helpers ─────────────────────────────────────────────────
-# Linux terminal candidates (tried in order)
+# Linux terminal candidates (tried in order). Each builder receives the full
+# bash -c command string s (already wrapped by _run_in_external_terminal with
+# the exit-code/PID-file wrapper) and the working directory. s is always passed
+# as a single argv element — never interpolated inside quotes — so spaces and
+# special characters in paths cannot break quoting.
 _EXT_CANDIDATES = [
-    lambda s, cwd: (["gnome-terminal", "--wait", "--", "bash", "-c", s],   {"cwd": cwd}),
-    lambda s, cwd: (["xfce4-terminal", "--hold", "-e", f"bash -c '{s}'"],  {"cwd": cwd}),
-    lambda s, cwd: (["xterm", "-hold", "-e", f"bash -c '{s}'"],            {"cwd": cwd}),
-    lambda s, cwd: (["konsole", "--hold", "-e", "bash", "-c", s],          {"cwd": cwd}),
-    lambda s, cwd: (["lxterminal", "-e", f"bash -c '{s}'"],                {"cwd": cwd}),
-    lambda s, cwd: (["mate-terminal", "--window", "-e", f"bash -c '{s}'"], {"cwd": cwd}),
+    ("gnome-terminal",    lambda s, cwd: (["gnome-terminal", "--wait", "--", "bash", "-c", s], {"cwd": cwd})),
+    ("xfce4-terminal",    lambda s, cwd: (["xfce4-terminal", "--hold", "-e", "bash", "-c", s], {"cwd": cwd})),
+    ("xterm",             lambda s, cwd: (["xterm", "-hold", "-e", "bash", "-c", s],            {"cwd": cwd})),
+    ("konsole",           lambda s, cwd: (["konsole", "--hold", "-e", "bash", "-c", s],         {"cwd": cwd})),
+    ("lxterminal",        lambda s, cwd: (["lxterminal", "-e", "bash", "-c", s],                {"cwd": cwd})),
+    ("mate-terminal",     lambda s, cwd: (["mate-terminal", "--window", "-e", "bash", "-c", s], {"cwd": cwd})),
+    # ptyxis (default terminal on Fedora Workstation, GTK4/VTE). Two verified
+    # behaviors drive this entry:
+    #   1. It does not propagate the command's exit code to its own process —
+    #      crash detection therefore relies on the rc-file written by the
+    #      wrapper, not on proc.returncode.
+    #   2. Without -s it forwards the command to an existing instance and the
+    #      launching process exits immediately; with -s this Popen stays the
+    #      process hosting the command for its whole duration, which keeps
+    #      _monitor_external correct and makes SIGTERM delivery effective.
+    ("ptyxis",            lambda s, cwd: (["ptyxis", "-s", "-d", cwd, "--", "bash", "-c", s],   {"cwd": cwd})),
+    # Generic portal fallback, last resort (may not exist on the system).
+    ("xdg-terminal-exec", lambda s, cwd: (["xdg-terminal-exec", "--", "bash", "-c", s],         {"cwd": cwd})),
 ]
+
+
+def _generic_builder(name):
+    """Fallback builder for a terminal command supplied by the user."""
+    return lambda s, cwd: ([name, "--", "bash", "-c", s], {"cwd": cwd})
+
+
+def _terminal_preference() -> str:
+    """
+    Preferred terminal for open_outside entries, checked in order:
+      1. MAESTRO_TERMINAL environment variable
+      2. "terminal" key in settings.json
+    Empty string = auto-detect through _EXT_CANDIDATES.
+    """
+    v = os.environ.get("MAESTRO_TERMINAL", "").strip()
+    if v:
+        return v
+    try:
+        if _DATA_DIR:
+            on_disk = json.loads((_DATA_DIR / "settings.json").read_text(encoding="utf-8"))
+            v = str(on_disk.get("terminal", "")).strip()
+            if v:
+                return v
+    except Exception:
+        pass
+    return ""
 
 
 def _kill_ext(e):
@@ -637,6 +681,14 @@ def _kill_ext(e):
                 except Exception: pass
         threading.Thread(target=_force, daemon=True).start()
     else:
+        # Prefer the script's own shell PID recorded by the wrapper: for
+        # client/server terminals (ptyxis) the Popen PID may not be the process
+        # actually running the script, so the process-group kill alone can miss it.
+        try:
+            if e.ext_pid_file and e.ext_pid_file.exists():
+                os.kill(int(e.ext_pid_file.read_text().strip()), signal.SIGTERM)
+        except Exception:
+            pass
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         except (ProcessLookupError, PermissionError, OSError):
@@ -734,11 +786,50 @@ def _run_in_external_terminal(e, script_path: str, label: str = "Launch"):
         return None
     if needs_exec:
         _ensure_exec(script_path)
-    tail    = 'echo ""; echo "--- Done (exit: $?) ---"; read -p "Press Enter to close..."'
-    cmd_str = f'{" ".join(_shq(a) for a in argv)}; {tail}'
-    cwd     = str(Path(script_path).parent)
-    for builder in _EXT_CANDIDATES:
+    cwd = str(Path(script_path).parent)
+
+    # State files under data/: the wrapper writes the script's own shell PID and
+    # its exit status to files the daemon can read afterward. Needed because some
+    # emulators (ptyxis above all) do not propagate the command's exit code, so
+    # proc.returncode alone cannot distinguish "finished" from "crashed", and
+    # because client/server terminals report a PID that is not the shell actually
+    # running the script. The window stays open until a keypress in every case,
+    # so a crashed script can be inspected before it closes.
+    state_dir = _DATA_DIR / "terminal_state"
+    try: state_dir.mkdir(parents=True, exist_ok=True)
+    except Exception: pass
+    rc_file  = state_dir / f"{e.uid}.rc"
+    pid_file = state_dir / f"{e.uid}.pid"
+    for st in (rc_file, pid_file):
+        try:
+            if st.exists(): st.unlink()
+        except Exception: pass
+    e.ext_rc_file  = rc_file
+    e.ext_pid_file = pid_file
+
+    cmd_str = (
+        f'echo $$ > {_shq(str(pid_file))}; '
+        f"R=130; trap 'echo \"$R\" > {_shq(str(rc_file))}' EXIT; "
+        f'{" ".join(_shq(a) for a in argv)}; '
+        f'R=$?; echo "$R" > {_shq(str(rc_file))}; '
+        f'echo ""; echo "--- Done (exit: $R) ---"; '
+        f'read -p "Press Enter to close..."; exit $R'
+    )
+
+    named      = {name: builder for name, builder in _EXT_CANDIDATES}
+    candidates = []
+    pref = _terminal_preference()
+    if pref:
+        candidates.append((pref, named.get(pref) or _generic_builder(pref)))
+    candidates.extend(_EXT_CANDIDATES)
+    env_term = os.environ.get("TERMINAL", "").strip()
+    if env_term and env_term != pref:
+        candidates.append((env_term, _generic_builder(env_term)))
+
+    tried = []
+    for name, builder in candidates:
         cmd, kwargs = builder(cmd_str, cwd)
+        tried.append(name)
         try:
             proc = subprocess.Popen(
                 cmd, start_new_session=True,
@@ -749,21 +840,34 @@ def _run_in_external_terminal(e, script_path: str, label: str = "Launch"):
             )
             with _lock:
                 e.ext_proc = proc
+            # The wrapper records the script's real shell PID almost immediately;
+            # pick it up so the entry PID points at the process running the script.
+            script_pid = None
+            for _ in range(10):
+                if not pid_file.exists():
+                    time.sleep(0.1)
+                    continue
+                try: script_pid = int(pid_file.read_text().strip())
+                except Exception: pass
+                break
+            shown = script_pid or proc.pid
             _append_log(e,
-                f"[MAESTRO] ↗ {label} in external terminal — PID {proc.pid} ({cmd[0]})")
-            _mlog(f"[{e.display_name()}] ↗ {label}: {cmd[0]} PID {proc.pid}")
+                f"[MAESTRO] ↗ {label} in external terminal — PID {shown} ({name})")
+            _mlog(f"[{e.display_name()}] ↗ {label}: {name} PID {proc.pid}")
             return proc
         except FileNotFoundError:
             continue
         except Exception as ex:
             _mlog(f"[{e.display_name()}] ✕ External {label} ({cmd[0]}): {ex}")
             return None
+
     _append_log(
         e,
-        "[MAESTRO] ✕ No terminal emulator found "
-        "(tried: gnome-terminal, xfce4-terminal, xterm, konsole, lxterminal, mate-terminal)"
+        "[MAESTRO] ✕ No terminal emulator found (tried: " + ", ".join(tried) + "). "
+        "Set the 'terminal' key in settings.json (Settings → Server) or export "
+        "MAESTRO_TERMINAL, or install one of the terminals tried."
     )
-    _mlog(f"[{e.display_name()}] ✕ No terminal emulator found")
+    _mlog(f"[{e.display_name()}] ✕ No terminal emulator found (tried: {', '.join(tried)})")
     return None
 
 
@@ -964,98 +1068,17 @@ def _launch_external(e, gen: int):
         if e.manually_killed or e.generation != gen:
             _kill_ext(e)
             return
-        e.pid = proc.pid
+        # Prefer the script's own shell PID recorded by the wrapper, when it
+        # has already appeared (see _run_in_external_terminal).
+        script_pid = None
+        try:
+            if e.ext_pid_file and e.ext_pid_file.exists():
+                script_pid = int(e.ext_pid_file.read_text().strip())
+        except Exception:
+            pass
+        e.pid = script_pid or proc.pid
         save_config()
     threading.Thread(target=_monitor_external, args=(e, proc, gen), daemon=True).start()
-
-
-# ── Terminal-style line assembly ───────────────────────────────────────────────
-# A real terminal treats '\n' as "line finished" and '\r' as "go back to column 0", so
-# programs that print progress ("x1", "x2", "x3"...) with '\r' rewrite ONE line. Python's
-# text mode used to turn every '\r' into '\n', which put each update on a new line.
-# Here a line that is still being rewritten lives in `e.partial` (published as the SSE
-# event "partial", replaced by the next update) and only becomes a normal log line when
-# it is finished by '\n' (or when the process ends). Cursor-up redraws of several lines
-# (docker/yarn style multi-bar output) are NOT emulated.
-_ERASE_LINE = re.compile(r"\x1b\[(?:2K|[01]?G)")   # erase line / cursor to column 0 → behave like '\r'
-_INCOMPLETE_ESC = re.compile(r"\x1b(?:\[[0-9;?]*)?$")   # an escape sequence cut by the chunk boundary
-
-
-class _LineState:
-    __slots__ = ("line", "cr", "pending")
-
-    def __init__(self):
-        self.line    = ""      # visible content of the line being assembled
-        self.cr      = False   # a '\r' was seen: the next text overwrites `line`
-        self.pending = ""      # incomplete escape sequence carried over to the next chunk
-
-
-def _set_partial(e, text: str):
-    """Publish the current in-progress line ("" = none). Idempotent; guarded by subs_lock."""
-    with e.subs_lock:
-        if (e.partial or "") == text:
-            return
-        e.partial = text or None
-        dead = []
-        for q in e.subs:
-            try:    q.put_nowait(("partial", text))
-            except queue.Full: dead.append(q)
-        for q in dead:
-            e.subs.remove(q)
-
-
-def _commit_line(e, st: _LineState):
-    """The line is finished: drop the in-progress copy and log it once."""
-    line, st.line, st.cr = st.line, "", False
-    if e.partial:
-        _set_partial(e, "")
-    _append_log(e, line)
-
-
-def _feed_output(e, st: _LineState, text: str, final: bool = False):
-    """Feed decoded output into the line assembler of entry e."""
-    data = st.pending + text
-    st.pending = ""
-    if not final:
-        m = _INCOMPLETE_ESC.search(data)
-        if m:
-            st.pending, data = data[m.start():], data[:m.start()]
-    data = strip_ansi(_ERASE_LINE.sub("\r", data))
-    saw_cr = False
-    for tok in re.split(r"([\r\n])", data):
-        if tok == "\n":
-            _commit_line(e, st)
-            saw_cr = False
-        elif tok == "\r":
-            st.cr = saw_cr = True
-        elif tok:
-            if st.cr:
-                st.line, st.cr = tok, False      # overwrite the line
-            else:
-                st.line += tok
-    # Show a line that is being rewritten live. Ordinary partial lines (no '\r' involved)
-    # keep the old behaviour: they appear when the newline arrives.
-    if st.line and (saw_cr or st.cr or e.partial):
-        _set_partial(e, st.line)
-
-
-def _pump_output(e, gen: int, proc):
-    """Read the process pipe until EOF and turn it into log lines / in-progress updates."""
-    enc = (locale.getpreferredencoding(False) or "utf-8") if _WIN else "utf-8"
-    dec = codecs.getincrementaldecoder(enc)(errors="replace")
-    st  = _LineState()
-    while True:
-        chunk = proc.stdout.read(8192)       # returns as soon as some bytes are available
-        if not chunk:
-            break
-        if e.generation != gen:
-            return
-        _feed_output(e, st, dec.decode(chunk))
-    if e.generation != gen:
-        return
-    _feed_output(e, st, dec.decode(b"", final=True), final=True)
-    if st.line or e.partial:                  # unfinished last line: keep it as a normal line
-        _commit_line(e, st)
 
 
 def _reader(e, gen: int):
@@ -1118,11 +1141,63 @@ def _monitor(e, gen: int):
 
 def _monitor_external(e, proc, gen: int):
     """
-    Wait for the external terminal process to exit.
-    Updates e.pid and fires SSE events so the UI stays in sync.
+    Wait for an external terminal run to finish and publish the exit state.
+
+    Two shapes behave differently:
+      - Hosting terminals (ptyxis -s, xterm, ...): the Popen child lives for
+        the whole command, so its exit is the completion signal.
+      - Client-to-instance terminals (ptyxis when an instance is already
+        running): the CLI exits 0 immediately while the window keeps running
+        the command elsewhere — its returncode says nothing about the command.
+
+    The wrapper is ground truth whenever it can run: it records the script's
+    PID and writes the rc-file when the command ends (an EXIT trap also fires
+    if the window is closed or the shell is killed mid-run). So the rc-file
+    wins over the CLI exit code, and we keep waiting for it while the wrapper
+    is live.
     """
-    try:    proc.wait()
-    except Exception: pass
+    pid_file, rc_file = e.ext_pid_file, e.ext_rc_file
+    if pid_file is None:
+        try:    proc.wait()
+        except Exception: pass
+        rc = proc.returncode if proc.returncode is not None else "?"
+    else:
+        rc = None
+        while e.generation == gen and not _stop.is_set() and not rc_file.exists():
+            if e.manually_killed:
+                break
+            try:
+                # Adopt the script's real shell PID once the wrapper wrote it.
+                if pid_file.exists() and e.pid == proc.pid:
+                    sp = int(pid_file.read_text().strip())
+                    with _lock:
+                        if e.generation == gen: e.pid = sp
+            except Exception:
+                pass
+            if proc.poll() is not None:
+                # CLI exited. If the wrapper is actually running in a window,
+                # the command may still be in progress: wait for its rc-file.
+                try: live = pid_file.exists()
+                except Exception: live = False
+                end = time.time() + (600 if live else 5)
+                while (time.time() < end and e.generation == gen
+                       and not _stop.is_set() and not rc_file.exists()):
+                    if e.manually_killed:
+                        break
+                    time.sleep(0.2)
+                break
+            time.sleep(0.2)
+        # A kill can race with the trap's rc write: give it one last moment.
+        deadline = time.time() + 1.0
+        while not rc_file.exists() and time.time() < deadline:
+            time.sleep(0.1)
+        try:
+            if rc_file.exists():
+                rc = int(rc_file.read_text().strip())
+        except Exception:
+            pass
+        if rc is None:
+            rc = proc.returncode if proc.returncode is not None else "?"
     if e.generation != gen:
         return
     with _lock:

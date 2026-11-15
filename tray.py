@@ -289,6 +289,7 @@ _DEFAULT_SETTINGS = {
     "port":                8865,
     "dataDir":             "",
     "githubToken":         "",
+    "terminal":            "",
 }
 
 
@@ -1160,8 +1161,38 @@ def _extract_name(line: str) -> str:
 import urllib.request
 
 
+TRAY_PID_FILE = Path(tempfile.gettempdir()) / "MaestroTray.pid"
+
+
+def _check_single_tray() -> bool:
+    """
+    Refuse a second tray instance. The common double-launch case (autostart +
+    manual start) leaves two tray.py processes fighting over the same icon,
+    one of them invisible. Same trust model as main.py's PID guard, verified
+    against tray.py's own cmdline where /proc is available.
+    """
+    if TRAY_PID_FILE.exists():
+        try:
+            ex = int(TRAY_PID_FILE.read_text().strip())
+            os.kill(ex, 0)
+            if ex != os.getpid():
+                try:
+                    trusted = b"tray.py" in Path(f"/proc/{ex}/cmdline").read_bytes()
+                except Exception:
+                    trusted = True  # can't verify — keep safe-by-default behavior
+                if trusted:
+                    print(f"[tray] already running (PID {ex})", file=sys.stderr)
+                    return False
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
+    TRAY_PID_FILE.write_text(str(os.getpid()))
+    return True
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
+    if not _check_single_tray():
+        return
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     # Generate Cairo PNG icons (Linux only; Windows uses GDI icons at runtime)

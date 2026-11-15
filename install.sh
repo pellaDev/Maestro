@@ -35,6 +35,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_INSTALL_DIR="${SCRIPT_DIR}"   # portable-first: installs inside the cloned folder
 INSTALL_DIR=""
 NO_AUTOSTART=false
+ASSUME_YES=false
+NO_MENU_ENTRY=false
 ERRORS=0
 
 # ── Args ───────────────────────────────────────────────────────────────────────
@@ -47,6 +49,8 @@ show_help() {
   echo "  --install-dir PATH   Install to PATH instead of the cloned folder"
   echo "                       Default: ${DEFAULT_INSTALL_DIR}"
   echo "  --no-autostart       Skip the autostart prompt"
+  echo "  --no-menu-entry      Skip the application menu entry prompt"
+  echo "  --yes                Non-interactive: accept each prompt's default answer"
   echo "  --help               Show this help"
   echo ""
   echo "Supported distros: Fedora/RHEL, Ubuntu/Debian/Mint, Arch/Manjaro, openSUSE"
@@ -55,9 +59,11 @@ show_help() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --install-dir)  INSTALL_DIR="$2"; shift 2 ;;
-    --no-autostart) NO_AUTOSTART=true; shift ;;
-    --help|-h)      show_help ;;
+    --install-dir)    INSTALL_DIR="$2"; shift 2 ;;
+    --no-autostart)   NO_AUTOSTART=true; shift ;;
+    --no-menu-entry)  NO_MENU_ENTRY=true; shift ;;
+    --yes)            ASSUME_YES=true; shift ;;
+    --help|-h)        show_help ;;
     *)              warn "Unknown option: $1"; shift ;;
   esac
 done
@@ -239,8 +245,13 @@ hdr "Install path"
 info "bin/  → ${BIN_DIR}"
 info "data/ → ${DATA_DIR}"
 echo ""
-read -rp "  Proceed? [Y/n] " CONFIRM
-CONFIRM="${CONFIRM:-Y}"
+if [[ "$ASSUME_YES" == true ]]; then
+  CONFIRM="Y"
+  info "Proceed (default answer, --yes)"
+else
+  read -rp "  Proceed? [Y/n] " CONFIRM
+  CONFIRM="${CONFIRM:-Y}"
+fi
 if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
   echo "  Aborted."
   exit 0
@@ -320,7 +331,8 @@ if [[ ! -f "$SETTINGS_FILE" ]]; then
   "systemNotifications": true,
   "host": "127.0.0.1",
   "port": 8865,
-  "dataDir": ""
+  "dataDir": "",
+  "terminal": ""
 }
 EOF
   # Fix #13: settings.json can later hold a GitHub PAT (githubToken) — make
@@ -350,8 +362,12 @@ if $NO_AUTOSTART; then
   info "Skipped (--no-autostart)"
 else
   echo ""
-  read -rp "  Enable autostart with OS login? [y/N] " AS
-  AS="${AS:-N}"
+  if [[ "$ASSUME_YES" == true ]]; then
+    AS="N"
+  else
+    read -rp "  Enable autostart with OS login? [y/N] " AS
+    AS="${AS:-N}"
+  fi
   if [[ "$AS" =~ ^[Yy]$ ]]; then
     mkdir -p "${HOME}/.config/autostart"
     cat > "$AUTOSTART_FILE" << EOF
@@ -382,8 +398,15 @@ fi
 # tray + background process only (Terminal=false).
 hdr "Application menu entry"
 echo ""
-read -rp "  Create an application menu entry (so Maestro shows up like an installed app)? [Y/n] " APPENTRY
-APPENTRY="${APPENTRY:-Y}"
+if [[ "$NO_MENU_ENTRY" == true ]]; then
+  APPENTRY="N"
+elif [[ "$ASSUME_YES" == true ]]; then
+  APPENTRY="Y"
+  info "Menu entry: default answer Y (--yes)"
+else
+  read -rp "  Create an application menu entry (so Maestro shows up like an installed app)? [Y/n] " APPENTRY
+  APPENTRY="${APPENTRY:-Y}"
+fi
 if [[ "$APPENTRY" =~ ^[Yy]$ ]]; then
   mkdir -p "${APPS_DIR}"
   cat > "${APP_ENTRY_FILE}" << EOF
@@ -414,10 +437,39 @@ echo -e "    ${DIM}# or from your application launcher, if the menu entry was cr
 echo ""
 echo -e "  ${BOLD}UI:${RST}"
 echo -e "    http://127.0.0.1:8865  (after launch)"
+echo -e "    ${DIM}Default port 8865 — change it only when explicitly asked.${RST}"
 echo ""
 echo -e "  ${BOLD}Data directory:${RST}"
 echo -e "    ${DATA_DIR}"
 echo -e "    ${DIM}config.txt, logs/, settings.json${RST}"
 echo ""
-echo -e "  ${DIM}To uninstall: rm -rf ${INSTALL_DIR}${RST}"
+echo -e "  ${BOLD}Tray icon on GNOME:${RST}"
+echo -e "    Stock GNOME Shell has no legacy system tray, so the tray icon is usually"
+echo -e "    INVISIBLE there without the AppIndicator shell extension. Without them"
+echo -e "    Maestro runs headless (web UI only) — that is normal, not an error."
+if $($AI3_OK); then
+  echo -e "    ${GRN}AppIndicator3 detected${RST} — enable the extension:"
+else
+  echo -e "    Install AppIndicator3, then enable the extension:"
+  echo -e "      $(_pkg_appindicator)"
+fi
+echo -e "      https://extensions.gnome.org/extension/615/appindicator-support/"
+echo -e "  ${BOLD}Detached start:${RST}"
+echo -e "    bash bin/start.sh stays attached to the terminal that runs it: closing"
+echo -e "    that window sends SIGHUP to tray.py and its main.py child, so Maestro"
+echo -e "    terminates. For detached startup use the menu entry or autostart, or:"
+echo -e "      setsid bash ${BIN_DIR}/start.sh &"
+echo ""
+echo -e "  ${BOLD}Verify the install (after first launch):${RST}"
+echo -e "    1. install.sh exited 0; bin/ and data/settings.json exist"
+echo -e "    2. settings.json shows host 127.0.0.1 and port 8865"
+echo -e "    3. listener visible: ss -ltn | grep 8865"
+echo -e "    4. the UI loads at http://127.0.0.1:8865"
+echo ""
+echo -e "  ${BOLD}Uninstall (full removal):${RST}"
+echo -e "    rm -rf ${INSTALL_DIR}"
+echo -e "    ${DIM}# plus what this installer may have created:${RST}"
+echo -e "    rm -f ${APP_ENTRY_FILE}   # application menu entry"
+echo -e "    rm -f ${AUTOSTART_FILE}   # autostart entry"
+echo -e "    ${DIM}# one tray process only — kill it before removing the files${RST}"
 echo ""
